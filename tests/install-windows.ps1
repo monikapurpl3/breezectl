@@ -73,6 +73,19 @@ try {
     Ok 'shim installed' (Test-Path (Join-Path $bin 'breezectl.cmd'))
     $help = & (Join-Path $bin 'breezectl.cmd') help | Select-Object -First 1
     Ok 'the shim runs breezectl' ($help -match '^breezectl \d')
+    # A saved login, decrypted by Windows PowerShell started through the shim
+    # from whichever PowerShell runs this test: from PowerShell 7 that used to
+    # inherit 7's module path and fail to load ConvertTo-SecureString.
+    $sv = Join-Path $env:BREEZECTL_CONFIG 'servers'
+    New-Item -ItemType Directory -Force -Path $sv | Out-Null
+    $enc = { param($t) ConvertFrom-SecureString (ConvertTo-SecureString $t -AsPlainText -Force) }
+    [ordered]@{ base_url = 'http://127.0.0.1:9'; api_key_dpapi = (& $enc 'k'); device_token_dpapi = (& $enc 't'); token_id = 'x'; label = 'shim test' } |
+        ConvertTo-Json | Set-Content -Encoding ASCII (Join-Path $sv 'shimtest.json')
+    # Continue for this call: in 5.1, stderr through 2>&1 under Stop is a
+    # terminating error, and this one is expected.
+    $out = & { $ErrorActionPreference = 'Continue'; & (Join-Path $bin 'breezectl.cmd') --server shimtest status 2>&1 } | Out-String
+    Ok "the shim decrypts a saved login ($($PSVersionTable.PSEdition) starting it): $($out.Trim())" ($out -match 'cannot connect to http://127\.0\.0\.1:9')
+    Remove-Item (Join-Path $sv 'shimtest.json')
     $prof = [IO.File]::ReadAllBytes($env:BREEZECTL_TEST_PROFILE)
     Ok 'profile: the old bytes are untouched' ([Convert]::ToBase64String($prof[0..($profileBytes.Length - 1)]) -eq [Convert]::ToBase64String($profileBytes))
     $profText = [Text.Encoding]::UTF8.GetString($prof)

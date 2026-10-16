@@ -149,9 +149,18 @@ function Write-FileBytes([string]$path, [byte[]]$bytes) {
 # cmd's own quoting, not PowerShell's: it passes its arguments on untouched.
 # Always Windows PowerShell 5.1 -- the one every Windows has, at a path that
 # never moves.
+#
+# Without PSModulePath: run from PowerShell 7, the shim would hand Windows
+# PowerShell 7's module path, and it would then try to load 7's modules in
+# place of its own and fail -- ConvertTo-SecureString, and with it every saved
+# login. pwsh cleans that variable only when it starts powershell.exe itself,
+# not through a .cmd. Unset, Windows PowerShell builds its own. setlocal keeps
+# the change to this one run.
 $Shim = @"
 @echo off
 rem breezectl: runs breezectl.ps1. Installed by the breezectl installer.
+setlocal
+set "PSModulePath="
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NoLogo -ExecutionPolicy Bypass -File "%~dp0..\breezectl.ps1" %*
 exit /b %ERRORLEVEL%
 "@

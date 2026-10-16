@@ -122,7 +122,14 @@ function Read-Server([string]$name) {
         if (Get-Field $data 'device_token_dpapi') { $s.Token = Unprotect-Text (Get-Field $data 'device_token_dpapi') }
         else { $s.Token = [string](Get-Field $data 'device_token') }
     } catch {
-        Fail "the login saved as '$name' was encrypted by another Windows account or machine -- pair again: breezectl login"
+        # Only a cryptographic failure means another account or machine; say
+        # anything else as it is, rather than send someone to re-pair for it.
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        if ($e -is [System.Security.Cryptography.CryptographicException]) {
+            Fail "the login saved as '$name' was encrypted by another Windows account or machine -- pair again: breezectl login"
+        }
+        Fail "cannot read the login saved as '${name}': $($e.Message)"
     }
     if (-not $s.Base -or -not $s.Key -or -not $s.Token) { Fail "$file is incomplete -- pair again: breezectl login" }
     return $s
