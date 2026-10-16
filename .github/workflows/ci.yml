@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The sh client under every shell and awk it claims, and ShellCheck.
+  shells:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shells and awks
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dash mksh ksh zsh busybox posh mawk gawk original-awk
+      - name: tests/run.sh under each shell
+        run: |
+          set -e
+          for sh in dash "bash --posix" bash mksh ksh93 posh zsh "busybox sh"; do
+            printf '%-12s ' "$sh"; LANG=C.UTF-8 $sh tests/run.sh | tail -n 1
+          done
+      - name: tests/run.sh with each awk
+        run: |
+          set -e
+          for awk in mawk gawk original-awk "busybox awk"; do
+            d=$(mktemp -d)
+            printf '#!/bin/sh\nexec %s "$@"\n' "$awk" >"$d/awk"; chmod 755 "$d/awk"
+            printf '%-12s ' "$awk"; PATH="$d:$PATH" LANG=C.UTF-8 dash tests/run.sh | tail -n 1
+          done
+      - name: ShellCheck
+        run: |
+          shellcheck -S warning -s sh breezectl install.sh stage.sh tests/run.sh tests/install-unix.sh
+          shellcheck -S warning -s bash completions/breezectl.bash
+      - name: Stage, as aspic would
+        run: sh stage.sh --dirty "$RUNNER_TEMP/dist" && cat "$RUNNER_TEMP/dist/SHA256SUMS"
+
+  # install.sh as zsh, bash, fish and dash users and as root, twice, then out.
+  install-linux:
+    runs-on: ubuntu-24.04
+    container: debian:13
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shells
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends zsh fish curl ca-certificates dash
+      - name: tests/install-unix.sh
+        run: |
+          sh stage.sh --dirty /dist
+          chmod -R a+rX "$PWD" /dist
+          sh tests/install-unix.sh /dist
+
+  # macOS: /bin/sh is bash 3.2 in POSIX mode, the login shell is zsh, and
+  # bash itself is 3.2.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/run.sh under /bin/sh, zsh and bash 3.2
+        run: |
+          set -e
+          for sh in /bin/sh /bin/zsh /bin/bash /bin/dash; do
+            [ -x "$sh" ] || continue
+            printf '%-10s ' "$sh"; LANG=en_US.UTF-8 "$sh" tests/run.sh | tail -n 1
+          done
+      - name: install.sh for a zsh user
+        run: |
+          set -e
+          sh stage.sh --dirty "$RUNNER_TEMP/dist"
+          export HOME="$RUNNER_TEMP/home" SHELL=/bin/zsh
+          mkdir -p "$HOME"
+          sh install.sh --from "$RUNNER_TEMP/dist" --no-login
+          test "$(zsh -i -c 'command -v breezectl' | tail -n 1)" = "$HOME/.local/bin/breezectl"
+          CAPTURE_RC="$HOME/.zshrc" zsh tests/zsh-capture.zsh 'breezectl ti' | grep -qx timers
+          bash -c '. "$HOME/.local/share/bash-completion/completions/breezectl"; complete -p breezectl'
+          cp "$HOME/.zshrc" "$RUNNER_TEMP/zshrc.after"
+          sh install.sh --from "$RUNNER_TEMP/dist" --no-login
+          cmp "$HOME/.zshrc" "$RUNNER_TEMP/zshrc.after"
+          sh install.sh --uninstall
+          test ! -e "$HOME/.local/bin/breezectl"
+          ! grep -q breezectl "$HOME/.zshrc"
+
+  # Both PowerShells on Windows: the client's tests, and install.ps1 on a
+  # throwaway registry key -- never the runner's real PATH.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/run.ps1
+        run: |
+          pwsh -NoProfile -File tests/run.ps1
+          if ($LASTEXITCODE) { exit 1 }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/run.ps1
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Stage
+        shell: bash
+        run: sh stage.sh --dirty "$RUNNER_TEMP/dist"
+      - name: tests/install-windows.ps1
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          pwsh -NoProfile -File tests/install-windows.ps1 -Dist $dist -PowerShell powershell
+          if ($LASTEXITCODE) { exit 1 }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/install-windows.ps1 -Dist $dist -PowerShell pwsh
+          if ($LASTEXITCODE) { exit 1 }
+
+  # PowerShell 7 off Windows: the same tests, where saved logins are plain
+  # files of mode 600.
+  pwsh-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pwsh -NoProfile -File tests/run.ps1

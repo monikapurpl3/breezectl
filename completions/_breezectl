@@ -1,0 +1,138 @@
+#compdef breezectl
+# zsh completion for breezectl.
+#
+# Unit names come from `breezectl __complete units`, which reads the list the
+# client keeps of the last units it saw, so a Tab does not wait on the network.
+# Names are matched case-insensitively, as breezectl matches them.
+
+_breezectl_servers() {
+  local -a names
+  names=(${(f)"$(_call_program servers breezectl __complete servers 2>/dev/null)"})
+  _wanted servers expl 'saved server' compadd -a names
+}
+
+_breezectl_units() {
+  local -a units srv
+  local i
+  # A --server earlier on the line is the server whose units to offer.
+  for (( i = 2; i < CURRENT; i++ )); do
+    case $words[i] in
+      --server|-s) srv=(--server "$words[i+1]") ;;
+      --server=*) srv=(--server "${words[i]#--server=}") ;;
+    esac
+  done
+  units=(${(f)"$(_call_program units breezectl $srv __complete units 2>/dev/null)"})
+  _wanted units expl 'unit' compadd -M 'm:{[:lower:][:upper:]}={[:upper:][:lower:]}' -a units
+}
+
+# The positional words after a unit's name: breeze-core control's own.
+_breezectl_slot() {
+  case $1 in
+    1) _wanted modes expl 'mode, or on/off' compadd cool heat dry auto fan on off none ;;
+    2) _message -e temperatures 'temperature, 16-30 in half degrees, or none'
+       compadd none ;;
+    3) _wanted flaps expl 'flaps' compadd both horizontal vertical off none ;;
+    4) _wanted speeds expl 'fan speed' compadd silent low medium high max auto none ;;
+    5) _wanted extras expl 'extra' compadd turbo eco turbo+eco no-turbo no-eco none ;;
+    6) _wanted timers expl 'switch off after' compadd 15m 30m 45m 1h 2h ;;
+  esac
+}
+
+_breezectl() {
+  local curcontext="$curcontext" expl
+  local -a commands
+  commands=(
+    'status:how the units are'
+    'units:the units and their ids'
+    'timers:list, set or cancel timers'
+    'login:pair this machine with a server'
+    'logout:revoke and forget a saved server'
+    'servers:list, choose, rename or remove saved servers'
+    'diag:check the server and this machine'
+    'nerd:diag, and a JSON report for a bug report'
+    'version:this version, and the server'\''s'
+    'help:usage'
+    'control:control a unit whose name is also a command'
+  )
+
+  if [[ $words[CURRENT-1] == (--server|-s) ]]; then
+    _breezectl_servers
+    return
+  fi
+
+  # Past the options that come before the command.
+  local i=2
+  while (( i < CURRENT )); do
+    case $words[i] in
+      --server|-s) (( i += 2 )) ;;
+      --server=*|--) (( i++ )) ;;
+      *) break ;;
+    esac
+  done
+
+  if (( i >= CURRENT )); then
+    if [[ $PREFIX == -* ]]; then
+      _wanted options expl 'option' compadd -- --server --help --version
+    else
+      # Not _alternative: it hands _describe options it does not take.
+      _describe -t commands command commands
+      _breezectl_units
+    fi
+    return
+  fi
+
+  local cmd=$words[i]
+  local pos=$(( CURRENT - i ))
+  case $cmd in
+    status|st)
+      _breezectl_units ;;
+    units|list|diag|doctor|version|help|--help|-h|--version|-V)
+      ;;
+    timers|timer)
+      if (( pos == 1 )); then
+        _wanted subcommands expl 'timers command' compadd list off start cancel
+        return
+      fi
+      case $words[i+1] in
+        off)
+          case $pos in
+            2) _breezectl_units ;;
+            3) _wanted durations expl 'after' compadd 15m 30m 45m 1h 2h ;;
+          esac ;;
+        start|on)
+          case $pos in
+            2) _breezectl_units ;;
+            3) _message -e times 'time, HH:MM on the server'\''s clock' ;;
+            4) _wanted days expl 'day' compadd today tomorrow 2 3 4 5 6 7 ;;
+          esac ;;
+        cancel|rm|delete)
+          if (( pos == 2 )); then
+            _wanted all expl 'every timer' compadd all
+            _breezectl_units
+          fi ;;
+      esac ;;
+    servers|server)
+      if (( pos == 1 )); then
+        _wanted subcommands expl 'servers command' compadd list use rename remove
+      elif (( pos == 2 )) && [[ $words[i+1] == (use|rename|remove|rm|forget) ]]; then
+        _breezectl_servers
+      fi ;;
+    logout|unpair)
+      (( pos == 1 )) && _breezectl_servers ;;
+    login|pair)
+      case $words[CURRENT-1] in
+        --ca) _files ;;
+        --name|--label) _message -e values 'a name' ;;
+        *) _wanted options expl 'option' compadd -- --name --label --ca --key-stdin --yes ;;
+      esac ;;
+    nerd)
+      (( pos == 1 )) && _files ;;
+    control)
+      if (( pos == 1 )); then _breezectl_units; else _breezectl_slot $(( pos - 1 )); fi ;;
+    *)
+      # The first word was a unit's name.
+      _breezectl_slot $pos ;;
+  esac
+}
+
+_breezectl "$@"

@@ -1,0 +1,1568 @@
+#!/bin/sh
+# breezectl -- control Breeze Core from any terminal.
+#
+#   breezectl 'kitchen' cool 24.5 both auto turbo 30m
+#   breezectl status
+#   breezectl login
+#
+# The server's own `breeze-core control`, for every other machine: one POSIX
+# sh script that needs curl and nothing else -- no jq, no Python. It talks to
+# the server's REST API with the API key and a device token of its own, paired
+# once with `breezectl login` the way a phone is, and revocable like one.
+#
+# Runs on dash, bash, busybox ash, the BSDs' sh, macOS's /bin/sh and Termux.
+# That is why it is strictly POSIX: no `local`, no arrays, no `[[`, and every
+# awk program is plain POSIX awk (BWK awk, mawk, busybox, gawk).
+#
+# Copyright 2026 Monika. AGPL-3.0-or-later; see LICENSE.
+
+VERSION=1.0.0
+
+# Run by zsh (`zsh breezectl`, or a system whose sh is zsh), behave as sh:
+# split words and expand globs the way the rest of this file expects.
+[ -n "${ZSH_VERSION:-}" ] && emulate sh
+
+set -u
+umask 077
+
+# ---------------------------------------------------------------- the basics
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'breezectl: %s\n' "$*" >&2; }
+die() { err "$@"; exit 1; }
+usage_die() { err "$@"; err "see: breezectl help"; exit 2; }
+
+# A degree sign only where the terminal can show one: in any other locale it
+# arrives as two stray bytes.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) DEG='°C' ;;
+  *) DEG='C' ;;
+esac
+
+CONF_DIR="${BREEZECTL_CONFIG:-${XDG_CONFIG_HOME:-${HOME:-.}/.config}/breezectl}"
+SERVERS_DIR="$CONF_DIR/servers"
+
+TMPD=""
+cleanup() {
+  # The terminal's echo comes back even if a secret prompt was interrupted.
+  if [ -n "${ECHO_OFF:-}" ]; then stty echo </dev/tty 2>/dev/null; fi
+  [ -n "$TMPD" ] && rm -rf "$TMPD"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM HUP
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/breezectl.XXXXXX") || die "cannot create a temporary directory"
+
+# ---------------------------------------------------------------------- JSON
+#
+# A JSON reader in POSIX awk, because jq is not on most of the machines this
+# is for. It flattens a document into one line per value:
+#
+#   <path> TAB <type> TAB <value>
+#
+# with paths like `.states.0.name`, and types s(tring), n(umber), b(oolean),
+# z (null), o(bject) and a(rray, whose value is its length). Run under LC_ALL=C,
+# so a \u escape becomes its UTF-8 bytes in every awk, and UTF-8 already in a
+# string passes through untouched. Newlines and tabs inside a string become
+# spaces: every value here is for one line of a terminal.
+
+JSON_AWK='
+function fail(m) { printf "JSONERROR\t%s\n", m; exit 1 }
+function ws(   c) {
+  while (P <= N) {
+    c = substr(S, P, 1)
+    if (c == " " || c == "\t" || c == "\n" || c == "\r") P++
+    else return
+  }
+}
+function hexval(h,   i, v, d) {
+  h = tolower(h)
+  if (length(h) != 4) fail("bad unicode escape")
+  v = 0
+  for (i = 1; i <= 4; i++) {
+    d = index("0123456789abcdef", substr(h, i, 1))
+    if (d == 0) fail("bad unicode escape")
+    v = v * 16 + d - 1
+  }
+  return v
+}
+function utf8(cp) {
+  if (cp < 32) return " "
+  if (cp < 128) return sprintf("%c", cp)
+  if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+  if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+  return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+}
+function str(   out, rest, i, c, cp, lo) {
+  P++
+  out = ""
+  for (;;) {
+    rest = substr(S, P)
+    i = match(rest, /["\\]/)
+    if (i == 0) fail("unterminated string")
+    out = out substr(rest, 1, i - 1)
+    P += i - 1
+    if (substr(S, P, 1) == "\"") { P++; return out }
+    c = substr(S, P + 1, 1)
+    if (c == "u") {
+      cp = hexval(substr(S, P + 2, 4))
+      P += 6
+      if (cp >= 55296 && cp < 56320 && substr(S, P, 2) == "\\u") {
+        lo = hexval(substr(S, P + 2, 4))
+        if (lo >= 56320 && lo < 57344) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); P += 6 }
+      }
+      out = out utf8(cp)
+      continue
+    }
+    if (c == "n" || c == "r" || c == "t" || c == "b" || c == "f") out = out " "
+    else if (c == "\"" || c == "\\" || c == "/") out = out c
+    else fail("bad escape")
+    P += 2
+  }
+}
+function emit(path, type, v) {
+  if (path == "") path = "."
+  printf "%s\t%s\t%s\n", path, type, v
+}
+function value(path,   c, rest) {
+  ws()
+  if (P > N) fail("unexpected end of input")
+  c = substr(S, P, 1)
+  if (c == "{") { object(path); return }
+  if (c == "[") { array(path); return }
+  if (c == "\"") { emit(path, "s", str()); return }
+  if (substr(S, P, 4) == "true") { emit(path, "b", "true"); P += 4; return }
+  if (substr(S, P, 5) == "false") { emit(path, "b", "false"); P += 5; return }
+  if (substr(S, P, 4) == "null") { emit(path, "z", ""); P += 4; return }
+  rest = substr(S, P, 64)
+  if (match(rest, /^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?/)) {
+    emit(path, "n", substr(rest, 1, RLENGTH)); P += RLENGTH; return
+  }
+  fail("unexpected character")
+}
+function object(path,   key, c) {
+  P++
+  emit(path, "o", "")
+  ws()
+  if (substr(S, P, 1) == "}") { P++; return }
+  for (;;) {
+    ws()
+    if (substr(S, P, 1) != "\"") fail("expected a key")
+    key = str()
+    ws()
+    if (substr(S, P, 1) != ":") fail("expected a colon")
+    P++
+    value(path "." key)
+    ws()
+    c = substr(S, P, 1)
+    P++
+    if (c == "}") return
+    if (c != ",") fail("expected a comma or a closing brace")
+  }
+}
+function array(path,   n, c) {
+  P++
+  n = 0
+  ws()
+  if (substr(S, P, 1) == "]") { P++; emit(path, "a", 0); return }
+  for (;;) {
+    value(path "." n)
+    n++
+    ws()
+    c = substr(S, P, 1)
+    P++
+    if (c == "]") { emit(path, "a", n); return }
+    if (c != ",") fail("expected a comma or a closing bracket")
+  }
+}
+{ S = S $0 "\n" }
+END { N = length(S); P = 1; value(""); ws(); if (P <= N) fail("trailing data") }
+'
+
+# jflat FILE: flatten FILE into FILE.flat. Non-zero if it is not JSON.
+jflat() {
+  LC_ALL=C awk "$JSON_AWK" "$1" >"$1.flat" || return 1
+  if grep -q '^JSONERROR' "$1.flat"; then return 1; fi
+  return 0
+}
+# jget FLAT PATH: the value at PATH (non-zero if absent).
+jget() { awk -F '\t' -v p="$2" '$1 == p { print $3; f = 1; exit } END { exit !f }' "$1"; }
+# jtype FLAT PATH: s n b z o a, or nothing.
+jtype() { awk -F '\t' -v p="$2" '$1 == p { print $2; exit }' "$1"; }
+
+# A JSON string literal. Control characters become spaces; nothing here sends
+# text where a newline would mean anything.
+json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+# ---------------------------------------------------------- saved servers
+#
+# One file per server in $CONF_DIR/servers/<name>.json, mode 600 in a
+# directory of mode 700, with the same keys as `breeze-core`'s own cli.json
+# (base_url, api_key, device_token, token_id) and a label. It holds a device
+# token, which is a credential for someone's heating: it is written no wider
+# than the one account that made it, and never passed on a command line.
+
+valid_name() {
+  case "$1" in
+    '' | *[!A-Za-z0-9._-]* | .* ) return 1 ;;
+  esac
+  [ "${#1}" -le 64 ]
+}
+
+server_file() { printf '%s/%s.json' "$SERVERS_DIR" "$1"; }
+
+list_servers() {
+  [ -d "$SERVERS_DIR" ] || return 0
+  for f in "$SERVERS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    n=${f##*/}
+    printf '%s\n' "${n%.json}"
+  done
+}
+
+current_server() {
+  if [ -n "${OPT_SERVER:-}" ]; then printf '%s' "$OPT_SERVER"; return; fi
+  if [ -n "${BREEZECTL_SERVER:-}" ]; then printf '%s' "$BREEZECTL_SERVER"; return; fi
+  if [ -f "$CONF_DIR/current" ]; then
+    cs=$(head -n 1 "$CONF_DIR/current")
+    if [ -n "$cs" ] && [ -f "$(server_file "$cs")" ]; then printf '%s' "$cs"; return; fi
+  fi
+  # Only one saved: there is no question which.
+  cs_all=$(list_servers)
+  if [ -n "$cs_all" ] && [ "$(printf '%s\n' "$cs_all" | wc -l | tr -d ' ')" = 1 ]; then
+    printf '%s' "$cs_all"
+  fi
+}
+
+# Load the selected server into BASE KEY TOKEN TOKEN_ID LABEL CA SERVER.
+load_server() {
+  SERVER=$(current_server)
+  if [ -n "$SERVER" ] && ! valid_name "$SERVER"; then
+    die "'$SERVER' cannot be a server name: letters, digits, dot, dash and underscore only"
+  fi
+  if [ -z "$SERVER" ]; then
+    if [ -z "$(list_servers)" ]; then
+      die "no server is saved yet -- pair this machine first: breezectl login"
+    fi
+    die "several servers are saved; pick one with: breezectl servers use NAME (or --server NAME)"
+  fi
+  ls_file=$(server_file "$SERVER")
+  [ -f "$ls_file" ] || die "no saved server called '$SERVER' (breezectl servers lists them)"
+  cp "$ls_file" "$TMPD/server.json"
+  jflat "$TMPD/server.json" || die "$ls_file is damaged -- remove it with: breezectl logout $SERVER"
+  BASE=$(jget "$TMPD/server.json.flat" .base_url) || die "$ls_file has no base_url"
+  KEY=$(jget "$TMPD/server.json.flat" .api_key) || die "$ls_file has no api_key"
+  TOKEN=$(jget "$TMPD/server.json.flat" .device_token) || die "$ls_file has no device_token"
+  TOKEN_ID=$(jget "$TMPD/server.json.flat" .token_id) || TOKEN_ID=""
+  LABEL=$(jget "$TMPD/server.json.flat" .label) || LABEL=""
+  CA=$(jget "$TMPD/server.json.flat" .ca_file) || CA=""
+}
+
+save_server() { # NAME
+  mkdir -p "$SERVERS_DIR" || die "cannot create $SERVERS_DIR"
+  chmod 700 "$CONF_DIR" "$SERVERS_DIR" 2>/dev/null
+  ss_tmp="$(server_file "$1").partial"
+  {
+    printf '{\n'
+    printf '  "base_url": %s,\n' "$(json_str "$BASE")"
+    printf '  "api_key": %s,\n' "$(json_str "$KEY")"
+    printf '  "device_token": %s,\n' "$(json_str "$TOKEN")"
+    printf '  "token_id": %s,\n' "$(json_str "$TOKEN_ID")"
+    printf '  "label": %s,\n' "$(json_str "$LABEL")"
+    printf '  "ca_file": %s,\n' "$(json_str "$CA")"
+    printf '  "saved_by": %s\n' "$(json_str "breezectl $VERSION")"
+    printf '}\n'
+  } >"$ss_tmp" || die "cannot write $ss_tmp"
+  chmod 600 "$ss_tmp"
+  mv -f "$ss_tmp" "$(server_file "$1")" || die "cannot save $(server_file "$1")"
+}
+
+set_current() { printf '%s\n' "$1" >"$CONF_DIR/current"; chmod 600 "$CONF_DIR/current" 2>/dev/null; }
+
+# ---------------------------------------------------------------- HTTP
+
+need_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  err "breezectl needs curl, and this system has none. Install it with one of:"
+  err "  apt install curl   |  dnf install curl   |  apk add curl   |  pacman -S curl"
+  err "  pkg install curl   (FreeBSD, Termux)     |  pkg_add curl (OpenBSD) | pkgin install curl (NetBSD)"
+  exit 1
+}
+
+# Which TLS library this curl uses, asked once (sets CURL_TLS).
+CURL_TLS=""
+curl_tls() {
+  [ -n "$CURL_TLS" ] && return 0
+  case "$(curl -V 2>/dev/null | sed -n 1p)" in
+    *[Ss]channel*) CURL_TLS=schannel ;;
+    *) CURL_TLS=other ;;
+  esac
+}
+
+# A path as curl will understand it. Under Git Bash or MSYS2, curl is a native
+# Windows program: MSYS converts paths in its arguments, but not in the config
+# it reads on standard input, where /tmp/... means nothing to it.
+case "$(uname -s 2>/dev/null)" in
+  MINGW* | MSYS* | CYGWIN*) cpath() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; } ;;
+  *) cpath() { printf '%s' "$1"; } ;;
+esac
+
+# One line of curl's config syntax. The key and token go to curl this way, on
+# its standard input -- on its command line they would be visible to every
+# user of the machine in `ps`.
+cfg() { printf '%s = "%s"\n' "$1" "$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+
+# api METHOD PATH [BODY-FILE]
+#
+# The response lands in $TMPD/resp (flattened to $TMPD/resp.flat), the status
+# in HTTP_STATUS and the round trip in HTTP_MS. Returns 0 for a 2xx, 1 for an
+# HTTP error (explained in API_ERROR), 2 when the server was never reached.
+api() {
+  a_method=$1 a_path=$2 a_body=${3:-}
+  rm -f "$TMPD/resp" "$TMPD/resp.flat" "$TMPD/meta" "$TMPD/curlerr"
+  : >"$TMPD/resp"
+  # Here, not in the block below: that is a pipeline, so a subshell, and
+  # would ask curl again for every request.
+  [ -n "${CA:-}" ] && curl_tls
+  {
+    cfg url "$BASE$a_path"
+    cfg request "$a_method"
+    cfg header "Accept: application/json"
+    [ -n "${KEY:-}" ] && cfg header "X-API-Key: $KEY"
+    [ -n "${TOKEN:-}" ] && cfg header "Authorization: Bearer $TOKEN"
+    if [ -n "$a_body" ]; then
+      cfg header "Content-Type: application/json"
+      cfg data-binary "@$(cpath "$a_body")"
+    fi
+    if [ -n "${CA:-}" ]; then
+      cfg cacert "$(cpath "$CA")"
+      # Windows' own TLS (Schannel, in Git Bash's curl) refuses a certificate
+      # whose revocation it cannot check -- every private CA without a CRL.
+      [ "$CURL_TLS" = schannel ] && printf 'ssl-revoke-best-effort\n'
+    fi
+    cfg user-agent "breezectl/$VERSION"
+    cfg output "$(cpath "$TMPD/resp")"
+    cfg write-out '%{http_code} %{time_total}'
+    cfg max-time "${BREEZECTL_TIMEOUT:-60}"
+    cfg connect-timeout 10
+    printf 'silent\nshow-error\n'
+  } | curl -K - >"$TMPD/meta" 2>"$TMPD/curlerr"
+  a_rc=$?
+  HTTP_STATUS=$(cut -d ' ' -f 1 <"$TMPD/meta" 2>/dev/null)
+  HTTP_MS=$(awk '{ printf "%d", $2 * 1000 + 0.5 }' "$TMPD/meta" 2>/dev/null)
+  if [ "$a_rc" -ne 0 ]; then
+    API_ERROR=$(transport_error "$a_rc")
+    return 2
+  fi
+  if [ -s "$TMPD/resp" ] && ! jflat "$TMPD/resp"; then
+    API_ERROR="the server's answer was not JSON (HTTP $HTTP_STATUS) -- is $BASE a Breeze Core server?"
+    return 2
+  fi
+  [ -s "$TMPD/resp" ] || : >"$TMPD/resp.flat"
+  case "$HTTP_STATUS" in 2??) return 0 ;; esac
+  API_ERROR=$(explain "$HTTP_STATUS")
+  return 1
+}
+
+transport_error() {
+  te_msg=$(sed -n 's/^curl: ([0-9]*) //p' "$TMPD/curlerr" | head -n 1)
+  case "$1" in
+    3) printf '%s is not a valid address' "$BASE" ;;
+    6) printf 'cannot find %s -- check the address' "$BASE" ;;
+    7) printf 'cannot connect to %s -- is the server running, and is the address right?' "$BASE" ;;
+    28) printf '%s did not answer in time' "$BASE" ;;
+    35 | 51 | 53 | 54 | 58 | 59 | 60 | 66 | 77 | 80 | 82 | 83 | 90 | 91)
+      printf 'the secure connection to %s failed: %s\n  (a server with its own certificate: pair with --ca FILE)' "$BASE" "$te_msg" ;;
+    52) printf '%s closed the connection without an answer -- http:// and https:// mixed up?' "$BASE" ;;
+    *) printf 'could not reach %s: %s' "$BASE" "${te_msg:-curl failed with code $1}" ;;
+  esac
+}
+
+# The reason in a failed response, which is the whole point of showing it.
+explain() {
+  ex_type=$(jtype "$TMPD/resp.flat" .detail)
+  case "$ex_type" in
+    s) ex_detail=$(jget "$TMPD/resp.flat" .detail) ;;
+    o) ex_detail=$(jget "$TMPD/resp.flat" .detail.detail) || ex_detail=$(jget "$TMPD/resp.flat" .detail.error) || ex_detail="refused" ;;
+    *) ex_detail=$(tr '\r\n' '  ' <"$TMPD/resp" 2>/dev/null | cut -c 1-200) ;;
+  esac
+  [ -n "$ex_detail" ] || ex_detail="no reason given"
+  case "$1" in
+    401) printf '%s\n  (run `breezectl login` to pair this machine again)' "$ex_detail" ;;
+    403) printf '%s\n  (that has to come from the server'"'"'s local network)' "$ex_detail" ;;
+    404) printf '%s' "$ex_detail" ;;
+    503) printf '%s\n  (the unit did not answer -- is it powered and on the network?)' "$ex_detail" ;;
+    *) printf '%s [HTTP %s]' "$ex_detail" "$1" ;;
+  esac
+}
+
+# api_or_die METHOD PATH [BODY]
+api_or_die() { api "$@" || die "$API_ERROR"; }
+
+# The address as typed, made into a base URL. A bare host or address is
+# assumed to be the server's own port on plain HTTP, which is how it ships.
+normalise_url() {
+  nu=$(printf '%s' "$1" | tr -d ' ')
+  nu=${nu%/}
+  case "$nu" in
+    http://* | https://*) ;;
+    *)
+      case "$nu" in
+        *:[0-9]*) nu="http://$nu" ;;
+        *) nu="http://$nu:8420" ;;
+      esac ;;
+  esac
+  printf '%s' "$nu"
+}
+
+# ------------------------------------------------------- control: parsing
+#
+# Positional, as `breeze-core control` is: NAME TYPE TEMPERATURE FLAP FAN EXTRA
+# TIMER, any of them `none`, all after NAME optional, a timer accepted
+# anywhere. The words and the error messages are the server CLI's, so the two
+# can be used interchangeably and a script written for one runs with the other.
+
+skipped() { case "$1" in none | - | '' | same | keep) return 0 ;; esac; return 1; }
+
+lower_ascii() { printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'; }
+
+timer_minutes() { # WORD -> minutes on stdout, or non-zero
+  tm_d=$(printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\)\([a-z][a-z]*\)$/\1/p')
+  tm_u=$(printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\)\([a-z][a-z]*\)$/\2/p')
+  [ -n "$tm_d" ] || return 1
+  tm_d=$(printf '%s' "$tm_d" | sed 's/^0*//')
+  [ -n "$tm_d" ] || tm_d=0
+  case "$tm_u" in
+    m | min | mins | minute | minutes) printf '%s' "$tm_d" ;;
+    h | hr | hrs | hour | hours) printf '%s' "$((tm_d * 60))" ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_temperature() { # WORD -> sets C_TEMP or fails with the message
+  pt=$1
+  pt=${pt%°}
+  pt=${pt%[cC]}
+  case "$pt" in
+    '' | *[!0-9.]* | *.*.* | .* | *.) PARSE_ERROR="'$1' is not a temperature"; return 1 ;;
+  esac
+  pt_check=$(awk -v v="$pt" 'BEGIN {
+    v = v + 0
+    if (v < 16 || v > 30) { printf "range %s", v; exit }
+    if (v * 2 != int(v * 2)) { printf "half %s", v; exit }
+    printf "ok %s", v }')
+  case "$pt_check" in
+    ok\ *) C_TEMP=${pt_check#ok }; return 0 ;;
+    range\ *) PARSE_ERROR="${pt_check#range } is outside the 16-30 $DEG the API accepts"; return 1 ;;
+    half\ *) PARSE_ERROR="${pt_check#half } is not a whole or half degree"; return 1 ;;
+  esac
+}
+
+parse_flap() {
+  case "$1" in
+    both | all) C_SWING=BOTH ;;
+    horizontal | h | lr | leftright) C_SWING=HORIZONTAL ;;
+    vertical | v | ud | updown) C_SWING=VERTICAL ;;
+    off | still | fixed) C_SWING=OFF ;;
+    *) PARSE_ERROR="'$1' is not a flap setting. Use both, horizontal, vertical, off or none"; return 1 ;;
+  esac
+}
+
+parse_fan() {
+  case "$1" in
+    silent | quiet) C_FAN=20 ;;
+    low | l) C_FAN=40 ;;
+    medium | med | m) C_FAN=60 ;;
+    high | h) C_FAN=80 ;;
+    max | full) C_FAN=100 ;;
+    auto | a) C_FAN=102 ;;
+    *)
+      pf=${1%\%}
+      case "$pf" in
+        '' | *[!0-9]*)
+          PARSE_ERROR="'$1' is not a fan speed. Use silent, low, medium, high, max, auto, none, or a percentage"
+          return 1 ;;
+      esac
+      pf=$(printf '%s' "$pf" | sed 's/^0*//')
+      case "$pf" in
+        20 | 40 | 60 | 80 | 100 | 102) C_FAN=$pf ;;
+        *) PARSE_ERROR="${pf:-0} is not one of the speeds the API accepts (20, 40, 60, 80, 100, 102)"; return 1 ;;
+      esac ;;
+  esac
+}
+
+parse_extra() {
+  # Both at once is accepted as turbo+eco: the API has two independent flags,
+  # and refusing the combination would be inventing a rule the server lacks.
+  pe_rest=$1
+  while [ -n "$pe_rest" ]; do
+    case "$pe_rest" in
+      *[+,]*) pe_part=${pe_rest%%[+,]*}; pe_rest=${pe_rest#*[+,]} ;;
+      *) pe_part=$pe_rest; pe_rest="" ;;
+    esac
+    case "$pe_part" in
+      '') ;;
+      turbo | boost) C_TURBO=true ;;
+      eco | saving) C_ECO=true ;;
+      noturbo | no-turbo) C_TURBO=false ;;
+      noeco | no-eco) C_ECO=false ;;
+      *) PARSE_ERROR="'$pe_part' is not an extra. Use turbo, eco, no-turbo, no-eco or none"; return 1 ;;
+    esac
+  done
+}
+
+apply_type() {
+  case "$1" in
+    off) C_POWER=false ;;
+    on) C_POWER=true ;;
+    cool | cooling) C_MODE=COOL; C_POWER=true ;;
+    heat | heating) C_MODE=HEAT; C_POWER=true ;;
+    dry | dehumidify) C_MODE=DRY; C_POWER=true ;;
+    auto) C_MODE=AUTO; C_POWER=true ;;
+    fan | fan_only | fanonly | ventilate) C_MODE=FAN_ONLY; C_POWER=true ;;
+    *) PARSE_ERROR="'$1' is not a mode. Use cool, heat, dry, auto, fan, on, off or none"; return 1 ;;
+  esac
+}
+
+# parse_control WORD... (everything after NAME) -> the C_* settings.
+parse_control() {
+  C_POWER="" C_MODE="" C_TEMP="" C_SWING="" C_FAN="" C_ECO="" C_TURBO="" C_TIMER=""
+  PARSE_ERROR=""
+  if [ "$#" -gt 6 ]; then
+    PARSE_ERROR="too many arguments: expected at most TYPE TEMPERATURE FLAP FAN EXTRA TIMER, got $#"
+    return 1
+  fi
+  pc_index=0
+  for pc_word in "$@"; do
+    pc_lower=$(lower_ascii "$pc_word")
+    if pc_min=$(timer_minutes "$pc_lower"); then
+      if [ -n "$C_TIMER" ]; then PARSE_ERROR="two timers were given"; return 1; fi
+      C_TIMER=$pc_min
+      continue
+    fi
+    if ! skipped "$pc_lower"; then
+      case "$pc_index" in
+        0) apply_type "$pc_lower" || return 1 ;;
+        1) parse_temperature "$pc_lower" || return 1 ;;
+        2) parse_flap "$pc_lower" || return 1 ;;
+        3) parse_fan "$pc_lower" || return 1 ;;
+        4) parse_extra "$pc_lower" || return 1 ;;
+        *) PARSE_ERROR="'$pc_word' is one argument too many"; return 1 ;;
+      esac
+    fi
+    pc_index=$((pc_index + 1))
+  done
+  return 0
+}
+
+# The request body: only what was asked for, in the server CLI's order.
+control_body() {
+  cb=""
+  [ -n "$C_POWER" ] && cb="$cb, \"power_state\": $C_POWER"
+  [ -n "$C_MODE" ] && cb="$cb, \"operational_mode\": \"$C_MODE\""
+  [ -n "$C_TEMP" ] && cb="$cb, \"target_temperature\": $C_TEMP"
+  [ -n "$C_SWING" ] && cb="$cb, \"swing_mode\": \"$C_SWING\""
+  [ -n "$C_FAN" ] && cb="$cb, \"fan_speed\": $C_FAN"
+  [ -n "$C_ECO" ] && cb="$cb, \"eco\": $C_ECO"
+  [ -n "$C_TURBO" ] && cb="$cb, \"turbo\": $C_TURBO"
+  printf '{%s}' "${cb#, }"
+}
+
+touches_the_unit() { [ -n "$C_POWER$C_MODE$C_TEMP$C_SWING$C_FAN$C_ECO$C_TURBO" ]; }
+
+# --------------------------------------------- what a unit says, in words
+
+# describe FLAT PREFIX: one line of what the unit at PREFIX reports.
+#
+# Switched off, it still says what the unit is set to -- the mode,
+# temperature, flaps and fan it will start with -- so a change made while it
+# is off is confirmed. Lower-case words: some screen readers spell an
+# all-capitals word out letter by letter.
+describe() {
+  awk -F '\t' -v pre="$2" -v deg="$DEG" '
+    function temp(f) { return (T[f] == "n") ? sprintf("%.1f", V[f]) : "--" }
+    function fan(n) {
+      if (n == 20) return "silent"; if (n == 40) return "low"; if (n == 60) return "medium"
+      if (n == 80) return "high"; if (n == 100) return "max"; if (n == 102) return "auto"
+      return n "%"
+    }
+    index($1, pre ".") == 1 {
+      k = substr($1, length(pre) + 2)
+      if (index(k, ".") == 0) { T[k] = $2; V[k] = $3 }
+    }
+    END {
+      mode = (T["operational_mode"] == "s") ? tolower(V["operational_mode"]) : "?"
+      gsub(/_/, " ", mode)
+      out = mode ", " temp("target_temperature") " " deg
+      if (T["swing_mode"] == "s" && V["swing_mode"] != "OFF") out = out ", swing " tolower(V["swing_mode"])
+      if (T["fan_speed"] == "n") out = out ", fan " fan(V["fan_speed"] + 0)
+      if (V["eco"] == "true") out = out ", eco"
+      if (V["turbo"] == "true") out = out ", turbo"
+      indoor = "indoor " temp("indoor_temperature") " " deg
+      if (T["power_state"] == "b" && V["power_state"] == "false") print "off, set to " out "; " indoor
+      else print out ", " indoor
+    }' "$1"
+}
+
+# not_applied FLAT PREFIX: the fields the unit did not take, as a sentence --
+# the same wording and reasons as the panel, the app and the server CLI, which
+# are what real units were measured doing. Nothing at all when it took
+# everything, or when the server is too old to say.
+not_applied() {
+  awk -F '\t' -v pre="$2" '
+    function name(f) {
+      if (f == "swing_mode") return "the flap change"
+      if (f == "fan_speed") return "the fan speed"
+      if (f == "target_temperature") return "the temperature"
+      if (f == "operational_mode") return "the mode"
+      if (f == "power_state") return "the power change"
+      gsub(/_/, " ", f); return f
+    }
+    $1 == pre ".power_state" { power = $3 }
+    $1 == pre ".operational_mode" { mode = $3 }
+    index($1, pre ".not_applied.") == 1 && $2 == "s" { F[n++] = $3 }
+    END {
+      if (n == 0) exit
+      for (i = 0; i < n; i++) {
+        if (i == 0) joined = name(F[i])
+        else if (i == n - 1) joined = joined " and " name(F[i])
+        else joined = joined ", " name(F[i])
+      }
+      on = (power == "true"); heating = (mode == "HEAT")
+      for (i = 0; i < n; i++) {
+        f = F[i]
+        if (f == "swing_mode" && !on) r = "Units only move their flaps while they are running."
+        else if (f == "swing_mode" && heating) r = "While heating, it holds its flaps still until warm air is coming out, which can take a few minutes after switching on or into heating. Try again shortly."
+        else if (f == "swing_mode") r = "It may need a moment before it will take this. Try again shortly."
+        else if (f == "eco" && heating) r = "Many units offer eco only while cooling, not while heating."
+        else if (f == "eco") r = "Many units offer eco only in some modes."
+        else if (f == "turbo") r = "Many units offer turbo only in some modes."
+        else r = "It does not take this in its current mode."
+        if (!(r in seen)) { seen[r] = 1; reasons = reasons (reasons == "" ? "" : " ") r }
+      }
+      printf "the air conditioner didn'"'"'t accept %s; the unit refused it, not Breeze Core. %s\n", joined, reasons
+    }' "$1"
+}
+
+# ------------------------------------------------------------- finding a unit
+
+# resolve_unit FLAT WANTED -> sets UNIT_ID UNIT_NAME, or dies with the reason.
+#
+# An id first (for scripts), then a unique case-insensitive name, then a
+# unique prefix. Ambiguity lists the candidates rather than picking one:
+# switching the wrong room's heating on is not a recoverable guess.
+resolve_unit() {
+  ru=$(awk -F '\t' -v want="$2" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    $1 ~ /^\.[0-9]+\.id$/ && $2 == "s" { i = $1; sub(/^\./, "", i); sub(/\.id$/, "", i); ID[i + 0] = $3; if (i + 1 > n) n = i + 1 }
+    $1 ~ /^\.[0-9]+\.name$/ && $2 == "s" { i = $1; sub(/^\./, "", i); sub(/\.name$/, "", i); NM[i + 0] = $3; if (i + 1 > n) n = i + 1 }
+    END {
+      if (n == 0) { print "E\tthis server has no units configured"; exit }
+      w = trim(want); lw = tolower(w)
+      for (i = 0; i < n; i++) if (ID[i] == w) { print "U\t" ID[i] "\t" NM[i]; exit }
+      c = 0
+      for (i = 0; i < n; i++) if (tolower(NM[i]) == lw) { c++; hit = i }
+      if (c == 1) { print "U\t" ID[hit] "\t" NM[hit]; exit }
+      if (c > 1) { printf "E\t'"'"'%s'"'"' matches %d units by name; use an id instead\n", want, c; exit }
+      c = 0; list = ""
+      for (i = 0; i < n; i++) if (index(tolower(NM[i]), lw) == 1) { c++; hit = i; list = list (c > 1 ? " or " : "") NM[i] }
+      if (c == 1) { print "U\t" ID[hit] "\t" NM[hit]; exit }
+      if (c > 1) { printf "E\t'"'"'%s'"'"' is ambiguous -- it could be %s\n", want, list; exit }
+      all = ""
+      for (i = 0; i < n; i++) all = all (i ? ", " : "") NM[i]
+      printf "E\tno unit matches '"'"'%s'"'"'. Known units: %s\n", want, all
+    }' "$1")
+  case "$ru" in
+    U*)
+      UNIT_ID=$(printf '%s' "$ru" | cut -f 2)
+      UNIT_NAME=$(printf '%s' "$ru" | cut -f 3-) ;;
+    *) die "$(printf '%s' "$ru" | cut -f 2-)" ;;
+  esac
+}
+
+fetch_units() { # -> $TMPD/units.json.flat
+  api_or_die GET /api/units
+  cp "$TMPD/resp" "$TMPD/units.json"
+  cp "$TMPD/resp.flat" "$TMPD/units.json.flat"
+  write_unit_cache
+}
+
+# The units' names, one per line, for tab completion, which reads this file
+# rather than asking the server at every Tab. Refreshed whenever the units
+# are fetched anyway; losing it costs nothing.
+unit_cache() { printf '%s/cache/%s.units' "$CONF_DIR" "$1"; }
+write_unit_cache() {
+  mkdir -p "$CONF_DIR/cache" 2>/dev/null || return 0
+  wc_file=$(unit_cache "$SERVER")
+  awk -F '\t' '$1 ~ /^\.[0-9]+\.name$/ { print $3 }' "$TMPD/units.json.flat" >"$wc_file.partial" 2>/dev/null &&
+    mv -f "$wc_file.partial" "$wc_file" 2>/dev/null
+  return 0
+}
+
+# ------------------------------------------------------------- the commands
+
+cmd_control() {
+  [ "$#" -ge 1 ] || { usage; exit 2; }
+  cc_name=$1
+  shift
+  # A name and nothing else asks how that unit is, rather than being an error.
+  # (`breezectl kitchen none` is still "nothing to do", as on the server.)
+  if [ "$#" -eq 0 ]; then cmd_status "$cc_name"; return; fi
+  parse_control "$@" || usage_die "$PARSE_ERROR"
+  if ! touches_the_unit && [ -z "$C_TIMER" ]; then
+    usage_die "nothing to do -- every setting was 'none'"
+  fi
+  load_server
+  fetch_units
+  resolve_unit "$TMPD/units.json.flat" "$cc_name"
+
+  if touches_the_unit; then
+    control_body >"$TMPD/body"
+    api_or_die POST "/api/units/$UNIT_ID/control" "$TMPD/body"
+    say "$UNIT_NAME: $(describe "$TMPD/resp.flat" "")"
+    # A change the unit ignored looks exactly like one it took unless it is
+    # said: the state above shows either way. Still exit 0 -- the request was
+    # carried out; the unit chose -- as the server CLI does.
+    cc_refused=$(not_applied "$TMPD/resp.flat" "")
+    [ -n "$cc_refused" ] && say "$UNIT_NAME: $cc_refused"
+  fi
+
+  if [ -n "$C_TIMER" ]; then
+    sleep_timer "$UNIT_ID" "$UNIT_NAME" "$C_TIMER"
+  fi
+}
+
+sleep_timer() { # ID NAME MINUTES
+  printf '{"unit_ids": [%s], "minutes": %s, "label": "breezectl"}' "$(json_str "$1")" "$3" >"$TMPD/body"
+  api_or_die POST /api/timers "$TMPD/body"
+  st_at=$(jget "$TMPD/resp.flat" .fires_at) || st_at=""
+  say "$2: switching off in $3 minutes$(at_phrase "$st_at" "$(( $3 * 60 ))")"
+}
+
+# ", at 21:45" -- with the date when it is not today on any reading -- from a
+# server's fires_at (its own clock, which is the one that counts).
+at_phrase() { # FIRES_AT SECONDS-REMAINING
+  [ -n "$1" ] || return 0
+  ap_time=$(printf '%s' "$1" | cut -c 12-16)
+  ap_date=$(printf '%s' "$1" | cut -c 1-10)
+  if [ "${2:-0}" -lt 43200 ]; then
+    printf ', at %s' "$ap_time"
+  else
+    printf ', at %s on %s' "$ap_time" "$ap_date"
+  fi
+}
+
+cmd_status() {
+  load_server
+  if [ "$#" -gt 0 ]; then
+    fetch_units
+    for cs_want in "$@"; do
+      resolve_unit "$TMPD/units.json.flat" "$cs_want"
+      if api GET "/api/units/$UNIT_ID/state"; then
+        if [ "$(jget "$TMPD/resp.flat" .online)" = false ]; then
+          say "$UNIT_NAME: offline"
+        else
+          say "$UNIT_NAME: $(describe "$TMPD/resp.flat" "")"
+        fi
+      else
+        say "$UNIT_NAME: did not answer -- $API_ERROR"
+      fi
+    done
+    return
+  fi
+  api_or_die GET /api/units/state
+  cs_states=$(jget "$TMPD/resp.flat" .states) || cs_states=0
+  cs_errors=$(jget "$TMPD/resp.flat" .errors) || cs_errors=0
+  if [ "$cs_states" = 0 ] && [ "$cs_errors" = 0 ]; then
+    say "This server has no units yet. Add them in the web panel, or on the server: breeze-core pair"
+    return
+  fi
+  cs_i=0
+  while [ "$cs_i" -lt "$cs_states" ]; do
+    cs_name=$(jget "$TMPD/resp.flat" ".states.$cs_i.name") || cs_name="?"
+    if [ "$(jget "$TMPD/resp.flat" ".states.$cs_i.online")" = false ]; then
+      say "$cs_name: offline"
+    else
+      say "$cs_name: $(describe "$TMPD/resp.flat" ".states.$cs_i")"
+    fi
+    cs_i=$((cs_i + 1))
+  done
+  cs_i=0
+  while [ "$cs_i" -lt "$cs_errors" ]; do
+    cs_name=$(jget "$TMPD/resp.flat" ".errors.$cs_i.name") || cs_name="a unit"
+    cs_why=$(jget "$TMPD/resp.flat" ".errors.$cs_i.error") || cs_why="no reason given"
+    say "$cs_name: did not answer -- $cs_why"
+    cs_i=$((cs_i + 1))
+  done
+}
+
+cmd_units() {
+  load_server
+  fetch_units
+  awk -F '\t' '
+    $1 ~ /^\.[0-9]+\.id$/ { i = $1; sub(/^\./, "", i); sub(/\.id$/, "", i); ID[i + 0] = $3; if (i + 1 > n) n = i + 1 }
+    $1 ~ /^\.[0-9]+\.name$/ { i = $1; sub(/^\./, "", i); sub(/\.name$/, "", i); NM[i + 0] = $3 }
+    END {
+      if (n == 0) { print "This server has no units yet."; exit }
+      for (i = 0; i < n; i++) if (length(NM[i]) > w) w = length(NM[i])
+      for (i = 0; i < n; i++) printf "%-" w "s  %s\n", NM[i], ID[i]
+    }' "$TMPD/units.json.flat"
+}
+
+# ----------------------------------------------------------------- timers
+
+# The pending timers, as sentences: "Kitchen: switches off in 25 min, at 21:45
+# (timer 3f2a)". Starts too, which an old server without them never lists.
+cmd_timers() {
+  ct_sub=${1:-list}
+  [ "$#" -gt 0 ] && shift
+  case "$ct_sub" in
+    list | ls) timers_list ;;
+    cancel | rm | delete) timers_cancel "$@" ;;
+    off) [ "$#" -eq 2 ] || usage_die "usage: breezectl timers off 'NAME' 30m"
+      tm=$(timer_minutes "$(lower_ascii "$2")") || usage_die "'$2' is not a duration (15m, 90min, 2h)"
+      load_server; fetch_units; resolve_unit "$TMPD/units.json.flat" "$1"
+      sleep_timer "$UNIT_ID" "$UNIT_NAME" "$tm" ;;
+    start | on) timers_start "$@" ;;
+    *) usage_die "unknown timers command '$ct_sub' -- list, off, start or cancel" ;;
+  esac
+}
+
+timers_list() {
+  load_server
+  fetch_units
+  api_or_die GET '/api/timers?kind=all'
+  cp "$TMPD/resp.flat" "$TMPD/timers.flat"
+  awk -F '\t' -v deg="$DEG" '
+    function remaining(s,   d, h, m) {
+      if (s < 60) return "in under a minute"
+      # Up to the next minute, as the server rounds its own "minutes": a timer
+      # set for 30 minutes a second ago is not "in 29 min".
+      s = int((s + 59) / 60) * 60
+      d = int(s / 86400); h = int((s % 86400) / 3600); m = int((s % 3600) / 60)
+      if (d > 0) return "in " d (d == 1 ? " day" : " days") (h ? " " h " h" : "")
+      if (h > 0) return "in " h " h" (m ? " " m " min" : "")
+      return "in " m " min"
+    }
+    FILENAME == ARGV[1] {
+      if ($1 ~ /^\.[0-9]+\.id$/) { i = $1; sub(/^\./, "", i); sub(/\.id$/, "", i); UID[i + 0] = $3; if (i + 1 > nu) nu = i + 1 }
+      if ($1 ~ /^\.[0-9]+\.name$/) { i = $1; sub(/^\./, "", i); sub(/\.name$/, "", i); UNM[i + 0] = $3 }
+      next
+    }
+    {
+      if (split($1, p, ".") < 3) next
+      t = p[2] + 0; if (t + 1 > nt) nt = t + 1
+      f = p[3]
+      if (f == "unit_ids" && p[4] != "") { if ($2 == "s") U[t, ++UC[t]] = $3 }
+      else if (f == "settings" && p[4] != "") S[t, p[4]] = $3
+      else if (p[4] == "") V[t, f] = $3
+    }
+    END {
+      for (j = 0; j < nu; j++) NAMEOF[UID[j]] = UNM[j]
+      if (nt == 0) { print "No timers are pending."; exit }
+      for (t = 0; t < nt; t++) {
+        who = ""
+        for (k = 1; k <= UC[t]; k++) {
+          nm = (U[t, k] in NAMEOF) ? NAMEOF[U[t, k]] : U[t, k]
+          if (k == 1) who = nm
+          else if (k == UC[t]) who = who " and " nm
+          else who = who ", " nm
+        }
+        if (UC[t] == 0) who = "every unit"
+        what = (S[t, "power_state"] == "true") ? "switches on" : "switches off"
+        extra = ""
+        if ((t, "operational_mode") in S) extra = extra ", " tolower(S[t, "operational_mode"])
+        if ((t, "target_temperature") in S) extra = extra ", " sprintf("%.1f", S[t, "target_temperature"]) " " deg
+        if (S[t, "eco"] == "true") extra = extra ", eco"
+        if (S[t, "turbo"] == "true") extra = extra ", turbo"
+        if (extra != "" && !((t, "power_state") in S)) what = "changes"
+        s = V[t, "seconds_remaining"] + 0
+        at = V[t, "fires_at"]; hhmm = substr(at, 12, 5); day = substr(at, 1, 10)
+        when = remaining(s) ", at " hhmm (s >= 43200 ? " on " day : "")
+        printf "%s: %s%s %s (timer %s)\n", who, what, extra, when, V[t, "id"]
+      }
+    }' "$TMPD/units.json.flat" "$TMPD/timers.flat"
+}
+
+timers_cancel() {
+  [ "$#" -eq 1 ] || usage_die "usage: breezectl timers cancel ID|'NAME'|all"
+  load_server
+  api_or_die GET '/api/timers?kind=all'
+  cp "$TMPD/resp.flat" "$TMPD/timers.flat"
+  tc_n=$(jget "$TMPD/timers.flat" .) || tc_n=0
+  tc_ids=""
+  tc_i=0
+  while [ "$tc_i" -lt "$tc_n" ]; do
+    tc_id=$(jget "$TMPD/timers.flat" ".$tc_i.id")
+    if [ "$1" = all ] || [ "$1" = "$tc_id" ]; then tc_ids="$tc_ids $tc_id"; fi
+    tc_i=$((tc_i + 1))
+  done
+  if [ -z "$tc_ids" ] && [ "$1" != all ]; then
+    # Not an id: a unit, and every timer that names it.
+    fetch_units
+    resolve_unit "$TMPD/units.json.flat" "$1"
+    tc_ids=$(awk -F '\t' -v id="$UNIT_ID" '$1 ~ /^\.[0-9]+\.unit_ids\.[0-9]+$/ && $3 == id { split($1, p, "."); print p[2] }' "$TMPD/timers.flat" |
+      while read -r tc_k; do jget "$TMPD/timers.flat" ".$tc_k.id"; done | tr '\n' ' ')
+    if [ -z "$tc_ids" ]; then
+      tc_every=$(awk -F '\t' '$1 ~ /^\.[0-9]+\.unit_ids$/ && $3 == 0' "$TMPD/timers.flat")
+      if [ -n "$tc_every" ]; then
+        die "no timer names $UNIT_NAME, but a timer for every unit is pending -- cancel it by id (breezectl timers)"
+      fi
+      say "No timer is pending for $UNIT_NAME."
+      return
+    fi
+  fi
+  [ -n "$tc_ids" ] || { say "No timers are pending."; return; }
+  for tc_id in $tc_ids; do
+    case "$tc_id" in *[!A-Za-z0-9_-]*) die "unexpected timer id '$tc_id'" ;; esac
+    api_or_die DELETE "/api/timers/$tc_id"
+    say "Cancelled timer $tc_id."
+  done
+}
+
+timers_start() { # 'NAME' HH:MM [DAYS|today|tomorrow]
+  [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage_die "usage: breezectl timers start 'NAME' 07:30 [tomorrow|DAYS]"
+  case "$2" in
+    [0-1][0-9]:[0-5][0-9] | 2[0-3]:[0-5][0-9]) ts_at=$2 ;;
+    [0-9]:[0-5][0-9]) ts_at="0$2" ;;
+    *) usage_die "'$2' is not a time -- use HH:MM, 24-hour, on the server's clock" ;;
+  esac
+  ts_days=0
+  case "$(lower_ascii "${3:-today}")" in
+    today) ts_days=0 ;;
+    tomorrow) ts_days=1 ;;
+    *[!0-9]* | '') usage_die "'$3' is not a number of days (0-30), today or tomorrow" ;;
+    *) ts_days=$(printf '%s' "$3" | sed 's/^0*//'); ts_days=${ts_days:-0}
+       [ "$ts_days" -le 30 ] || usage_die "a start can be at most 30 days ahead" ;;
+  esac
+  load_server
+  fetch_units
+  resolve_unit "$TMPD/units.json.flat" "$1"
+  printf '{"unit_ids": [%s], "at": "%s", "days": %s, "label": "breezectl"}' "$(json_str "$UNIT_ID")" "$ts_at" "$ts_days" >"$TMPD/body"
+  api_or_die POST /api/timers "$TMPD/body"
+  ts_fires=$(jget "$TMPD/resp.flat" .fires_at) || ts_fires=""
+  say "$UNIT_NAME: switching on at $(printf '%s' "$ts_fires" | cut -c 12-16) on $(printf '%s' "$ts_fires" | cut -c 1-10), in the mode and at the temperature it last had"
+}
+
+# ------------------------------------------------- pairing: login, logout
+
+# Whether there is a terminal to ask: /dev/tty exists everywhere, but without
+# a controlling terminal (cron, CI, a container without -t) opening it fails.
+# Asked once, in a subshell, since a failed redirection may end the shell.
+TTY_OK=""
+tty_ok() {
+  if [ -z "$TTY_OK" ]; then
+    if (true </dev/tty) 2>/dev/null && (true >/dev/tty) 2>/dev/null; then TTY_OK=yes; else TTY_OK=no; fi
+  fi
+  [ "$TTY_OK" = yes ]
+}
+
+interactive() { [ -z "${OPT_YES:-}" ] && tty_ok; }
+
+# Read a line from the terminal -- /dev/tty, so that this works when the
+# script itself arrived on standard input (curl | sh). Only after
+# interactive() said yes. End of input (Ctrl-D) gives up rather than asking
+# again for ever.
+ask() { # PROMPT [DEFAULT] -> REPLY
+  printf '%s' "$1" >/dev/tty
+  if ! IFS= read -r REPLY </dev/tty && [ -z "$REPLY" ]; then
+    printf '\n' >/dev/tty
+    die "cancelled"
+  fi
+  [ -n "$REPLY" ] || REPLY=${2:-}
+}
+
+ask_secret() { # PROMPT -> REPLY, without echoing it
+  printf '%s' "$1" >/dev/tty
+  ECHO_OFF=1
+  stty -echo </dev/tty 2>/dev/null
+  as_rc=0
+  IFS= read -r REPLY </dev/tty || as_rc=1
+  stty echo </dev/tty 2>/dev/null
+  ECHO_OFF=""
+  printf '\n' >/dev/tty
+  [ "$as_rc" -eq 0 ] || [ -n "$REPLY" ] || die "cancelled"
+}
+
+this_host() { hostname 2>/dev/null || uname -n 2>/dev/null || printf 'this machine'; }
+
+# breezectl login [URL] [--name NAME] [--label LABEL] [--key-stdin] [--ca FILE] [--yes]
+#
+# The phone's pairing, from a terminal: the server's address, its API key, a
+# code that someone approves on the server's own network, and a device token
+# that is this machine's alone. The key is checked before anything is asked
+# of the server, so a typo is "the server refused that key", not a mystery.
+cmd_login() {
+  li_url="" li_name="" li_label="" li_key_stdin="" CA=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || usage_die "--name needs a value"; li_name=$2; shift 2 ;;
+      --label) [ "$#" -ge 2 ] || usage_die "--label needs a value"; li_label=$2; shift 2 ;;
+      --ca) [ "$#" -ge 2 ] || usage_die "--ca needs a file"; CA=$2; shift 2 ;;
+      --key-stdin) li_key_stdin=1; shift ;;
+      --yes | -y) OPT_YES=1; shift ;;
+      -*) usage_die "unknown option $1" ;;
+      *) [ -z "$li_url" ] || usage_die "one server address at a time"; li_url=$1; shift ;;
+    esac
+  done
+  if [ -n "$CA" ]; then
+    [ -r "$CA" ] || die "cannot read the certificate $CA"
+    case "$CA" in /*) ;; *) CA="$(pwd)/$CA" ;; esac
+  fi
+
+  # The key first, from standard input, before anything else reads it.
+  li_key=""
+  if [ -n "$li_key_stdin" ]; then
+    IFS= read -r li_key || li_key=""
+    li_key=$(printf '%s' "$li_key" | tr -d ' \r')
+    [ -n "$li_key" ] || die "--key-stdin: nothing arrived on standard input"
+  fi
+
+  say "Pairing this machine with a Breeze Core server."
+  KEY="" TOKEN=""
+  while :; do
+    if [ -z "$li_url" ]; then
+      interactive || die "give the server's address: breezectl login URL"
+      ask "Server address (e.g. 192.168.1.10 or https://breeze.example.com): "
+      li_url=$REPLY
+      [ -n "$li_url" ] || continue
+    fi
+    BASE=$(normalise_url "$li_url")
+    if api GET /api/health && [ "$(jget "$TMPD/resp.flat" .status)" = ok ]; then
+      say "Found a Breeze Core server at $BASE."
+      break
+    fi
+    err "${API_ERROR:-$BASE answered, but not as a Breeze Core server does}"
+    interactive || exit 1
+    li_url=""
+  done
+
+  li_tries=0
+  while :; do
+    if [ -z "$li_key" ]; then
+      interactive || die "give the API key on standard input: --key-stdin"
+      say "The API key is in the server's config.json (\"api_key\"), or ask whoever runs it."
+      ask_secret "API key (not shown as you type): "
+      li_key=$(printf '%s' "$REPLY" | tr -d ' \r')
+      [ -n "$li_key" ] || continue
+    fi
+    KEY=$li_key
+    if api GET /api/version; then
+      li_ver=$(jget "$TMPD/resp.flat" .version) || li_ver="?"
+      say "The key is right. The server runs Breeze Core $li_ver."
+      break
+    fi
+    case "$HTTP_STATUS" in
+      401) err "the server refused that API key" ;;
+      *) die "$API_ERROR" ;;
+    esac
+    li_tries=$((li_tries + 1))
+    interactive && [ "$li_tries" -lt 3 ] || exit 1
+    li_key=""
+  done
+
+  [ -n "$li_label" ] || li_label="breezectl on $(this_host)"
+  if interactive; then
+    ask "Name this device on the server [$li_label]: " "$li_label"
+    li_label=$REPLY
+  fi
+  if [ -z "$li_name" ]; then
+    li_name=$(printf '%s' "$BASE" | sed 's#^[a-z]*://##; s#[:/].*##' | tr -c 'A-Za-z0-9._\n-' '-')
+    valid_name "$li_name" || li_name=server
+    if interactive; then
+      ask "Save this server as [$li_name]: " "$li_name"
+      li_name=$REPLY
+    fi
+  fi
+  valid_name "$li_name" || die "'$li_name' cannot be a name: letters, digits, dot, dash and underscore only"
+  if [ -f "$(server_file "$li_name")" ]; then
+    if interactive; then
+      ask "A server called '$li_name' is already saved. Replace it? [y/N] "
+      case "$REPLY" in [yY]*) ;; *) die "kept the existing '$li_name'; choose another name with --name" ;; esac
+    elif [ -z "${OPT_YES:-}" ]; then
+      die "a server called '$li_name' is already saved -- choose another --name, or --yes to replace it"
+    fi
+    say "Note: the old pairing stays valid on the server until it is revoked there."
+  fi
+
+  printf '{"label": %s, "auth_version": 1}' "$(json_str "$li_label")" >"$TMPD/body"
+  api_or_die POST /api/auth/enroll/start "$TMPD/body"
+  li_session=$(jget "$TMPD/resp.flat" .session_id) || die "the server did not return a session"
+  li_code=$(jget "$TMPD/resp.flat" .user_code) || die "the server did not return a code"
+  li_ttl=$(jget "$TMPD/resp.flat" .expires_in) || li_ttl=60
+  li_ttl=${li_ttl%%.*}
+
+  say ""
+  say "Pairing code: $li_code"
+  # Approval is allowed only from the server's own network. From there this
+  # machine can approve itself, as the server CLI does, and nobody has to walk
+  # to a browser to rubber-stamp it.
+  printf '{"code": %s}' "$(json_str "$li_code")" >"$TMPD/body"
+  if api POST /api/auth/enroll/approve "$TMPD/body"; then
+    say "Approved from here: this machine is on the server's local network."
+  else
+    say "It has to be approved on the server's local network, within $li_ttl seconds:"
+    say "  in the web panel, which shows the code to approve, or"
+    say "  on the server:  breeze-core approve $li_code"
+    say "Waiting for the approval... (Ctrl-C to give up)"
+  fi
+
+  printf '{"session_id": %s}' "$(json_str "$li_session")" >"$TMPD/poll"
+  li_waited=0 li_said=0
+  while :; do
+    api_or_die POST /api/auth/enroll/poll "$TMPD/poll"
+    li_status=$(jget "$TMPD/resp.flat" .status) || li_status=unknown
+    [ "$li_status" = pending ] || break
+    if [ "$li_waited" -ge "$((li_ttl + 5))" ]; then li_status=expired; break; fi
+    sleep 2
+    li_waited=$((li_waited + 2))
+    # Every 15 seconds, not every tick: a screen reader reads every line.
+    if [ $((li_waited - li_said)) -ge 15 ]; then
+      say "  still waiting, about $((li_ttl - li_waited > 0 ? li_ttl - li_waited : 0)) seconds left"
+      li_said=$li_waited
+    fi
+  done
+  case "$li_status" in
+    approved) ;;
+    *) die "the pairing was not approved (status: $li_status) -- run breezectl login to try again" ;;
+  esac
+  TOKEN=$(jget "$TMPD/resp.flat" .device_token) || die "the server approved the pairing but issued no token"
+  TOKEN_ID=$(jget "$TMPD/resp.flat" .token_id) || TOKEN_ID=""
+  LABEL=$li_label
+  save_server "$li_name"
+  if [ -z "$(current_server_file_only)" ] || [ "$(list_servers | wc -l | tr -d ' ')" = 1 ]; then
+    set_current "$li_name"
+  fi
+
+  if api GET /api/auth/whoami; then
+    say "Paired as \"$(jget "$TMPD/resp.flat" .label)\". Saved as '$li_name' in $SERVERS_DIR."
+  else
+    die "paired and saved, but the server does not accept the new token: $API_ERROR"
+  fi
+  [ "$(current_server)" = "$li_name" ] || say "Use it with: breezectl --server $li_name ...  or make it the default: breezectl servers use $li_name"
+  say "Try: breezectl status"
+}
+
+current_server_file_only() { [ -f "$CONF_DIR/current" ] && head -n 1 "$CONF_DIR/current"; }
+
+# breezectl logout [NAME]: revoke this machine's pairing, then forget it.
+#
+# Revoking is allowed only from the server's local network. From anywhere
+# else the login is still forgotten here, and the message says how to revoke
+# it on the server -- a forgotten token that still works is the case worth
+# warning about.
+cmd_logout() {
+  [ "$#" -le 1 ] || usage_die "usage: breezectl logout [NAME]"
+  [ "$#" -eq 1 ] && OPT_SERVER=$1
+  load_server
+  if [ -n "$TOKEN_ID" ]; then
+    case "$TOKEN_ID" in *[!A-Za-z0-9_-]*) die "unexpected token id '$TOKEN_ID'" ;; esac
+    if api DELETE "/api/auth/devices/$TOKEN_ID"; then
+      say "Revoked \"$LABEL\" on the server."
+    else
+      case "$HTTP_STATUS" in
+        404) say "The server no longer knew this pairing; nothing to revoke." ;;
+        *)
+          say "Not revoked on the server: $API_ERROR" | head -n 1
+          say "Revoke \"$LABEL\" there yourself: in the web panel's device list, or on the server:"
+          say "  breeze-core revoke $TOKEN_ID" ;;
+      esac
+    fi
+  else
+    say "This login has no token id to revoke; revoke \"$LABEL\" in the web panel if it is still listed."
+  fi
+  rm -f "$(server_file "$SERVER")" "$(unit_cache "$SERVER")"
+  if [ "$(current_server_file_only)" = "$SERVER" ]; then rm -f "$CONF_DIR/current"; fi
+  say "Forgot '$SERVER'."
+}
+
+cmd_servers() {
+  cv_sub=${1:-list}
+  [ "$#" -gt 0 ] && shift
+  case "$cv_sub" in
+    list | ls)
+      cv_all=$(list_servers)
+      if [ -z "$cv_all" ]; then say "No servers are saved. Pair one with: breezectl login"; return; fi
+      cv_cur=$(current_server)
+      for cv in $cv_all; do
+        cp "$(server_file "$cv")" "$TMPD/s.json"
+        if jflat "$TMPD/s.json"; then
+          cv_url=$(jget "$TMPD/s.json.flat" .base_url) || cv_url="?"
+          cv_label=$(jget "$TMPD/s.json.flat" .label) || cv_label=""
+        else
+          cv_url="(damaged file)" cv_label=""
+        fi
+        if [ "$cv" = "$cv_cur" ]; then cv_mark="*"; else cv_mark=" "; fi
+        say "$cv_mark $cv  $cv_url${cv_label:+  paired as \"$cv_label\"}"
+      done
+      [ -n "$cv_cur" ] && say "(* is the default)" ;;
+    use)
+      [ "$#" -eq 1 ] || usage_die "usage: breezectl servers use NAME"
+      [ -f "$(server_file "$1")" ] || die "no saved server called '$1' (breezectl servers lists them)"
+      set_current "$1"
+      say "'$1' is now the default." ;;
+    rename)
+      [ "$#" -eq 2 ] || usage_die "usage: breezectl servers rename OLD NEW"
+      [ -f "$(server_file "$1")" ] || die "no saved server called '$1'"
+      valid_name "$2" || die "'$2' cannot be a name: letters, digits, dot, dash and underscore only"
+      [ ! -e "$(server_file "$2")" ] || die "'$2' is already taken"
+      mv "$(server_file "$1")" "$(server_file "$2")" || die "cannot rename"
+      if [ -f "$(unit_cache "$1")" ]; then mv -f "$(unit_cache "$1")" "$(unit_cache "$2")" 2>/dev/null; fi
+      [ "$(current_server_file_only)" = "$1" ] && set_current "$2"
+      say "Renamed '$1' to '$2'." ;;
+    remove | rm | forget) cmd_logout "$@" ;;
+    *) usage_die "unknown servers command '$cv_sub' -- list, use, rename or remove" ;;
+  esac
+}
+
+# breezectl __complete servers|units -- for the shell completions: the saved
+# servers, or the units of the current one (--server picks another). Prints
+# nothing rather than an error. The server is asked only when no list of units
+# has been seen yet, and only briefly: a Tab must not hang.
+cmd_complete() {
+  case "${1:-}" in
+    servers) list_servers ;;
+    units)
+      cc_name=$(current_server)
+      [ -n "$cc_name" ] && valid_name "$cc_name" || exit 0
+      if [ ! -f "$(unit_cache "$cc_name")" ] && command -v curl >/dev/null 2>&1; then
+        (BREEZECTL_TIMEOUT=3; load_server; fetch_units) >/dev/null 2>&1
+      fi
+      cat "$(unit_cache "$cc_name")" 2>/dev/null ;;
+  esac
+  exit 0
+}
+
+# ------------------------------------------------------------ diag and nerd
+#
+# The server CLI's own checks (`breeze-core diag`), from this machine's side
+# of the network, plus this machine's half: curl, and whether the saved login
+# is private. Verdicts, not a wall of output, so the answer to "is anything
+# wrong" survives being pasted into a bug report.
+
+report() { # VERDICT MESSAGE
+  case "$1" in
+    ok) rp_l="OK  " ;; warn) rp_l="WARN" ;; fail) rp_l="FAIL" ;; *) rp_l="skip" ;;
+  esac
+  say "  $rp_l $2"
+  printf '%s\t%s\n' "$1" "$2" >>"$TMPD/report"
+}
+section() { say ""; say "== $1 =="; }
+count() { awk -F '\t' -v v="$1" '$1 == v { n++ } END { print n + 0 }' "$TMPD/report"; }
+
+cmd_diag() {
+  : >"$TMPD/report"
+  load_server
+  say "breezectl diag -> $BASE ($SERVER)"
+  diag_checks
+  section summary
+  say "  $(count ok) ok, $(count warn) warning(s), $(count fail) failure(s)"
+  if [ "$(count fail)" -gt 0 ]; then say "  result: PROBLEMS FOUND"
+  elif [ "$(count warn)" -gt 0 ]; then say "  result: OK, with warnings"
+  else say "  result: OK"
+  fi
+}
+
+diag_checks() {
+  section "this machine"
+  report ok "breezectl $VERSION, $(curl --version 2>/dev/null | head -n 1 | cut -d ' ' -f 1-2), on $(uname -s 2>/dev/null) $(uname -m 2>/dev/null)"
+  dc_mode=$(ls -ln "$(server_file "$SERVER")" 2>/dev/null | cut -c 1-10)
+  # Git Bash and Cygwin on NTFS have no Unix modes to show; the user's profile
+  # directory is what protects the file there.
+  case "$(uname -s 2>/dev/null)" in MINGW* | MSYS* | CYGWIN*) dc_mode=windows ;; esac
+  case "$dc_mode" in
+    windows) report skip "file modes do not apply on Windows; the file is in your own profile" ;;
+    -rw-------) report ok "the saved login is readable only by you" ;;
+    '') report warn "cannot read the saved login's permissions" ;;
+    *) report warn "the saved login is $dc_mode -- run: chmod 600 $(server_file "$SERVER")" ;;
+  esac
+
+  section server
+  if api GET /api/health && [ "$(jget "$TMPD/resp.flat" .status)" = ok ]; then
+    report ok "the server answers /api/health (${HTTP_MS} ms)"
+  else
+    report fail "cannot reach the server: ${API_ERROR:-health did not say ok}"
+    return
+  fi
+  if api GET /api/version; then
+    cp "$TMPD/resp" "$TMPD/version.json"
+    report ok "version $(jget "$TMPD/resp.flat" .version) (commit $(jget "$TMPD/resp.flat" .commit || printf unknown))"
+    DIAG_FEATURES=$(awk -F '\t' '$1 ~ /^\.features\.[0-9]+$/ { printf "%s ", $3 }' "$TMPD/resp.flat")
+    if [ -n "$DIAG_FEATURES" ]; then report ok "features: ${DIAG_FEATURES% }"
+    else report warn "the server advertises no features"; fi
+  else
+    DIAG_FEATURES=""
+    report fail "version failed: $API_ERROR"
+  fi
+
+  section authentication
+  if api GET /api/auth/whoami; then
+    report ok "this machine is paired as \"$(jget "$TMPD/resp.flat" .label)\" (auth v$(jget "$TMPD/resp.flat" .auth_version), id $(jget "$TMPD/resp.flat" .token_id))"
+  else
+    report fail "whoami failed: $(printf '%s' "$API_ERROR" | head -n 1)"
+  fi
+  # A wrong key must be refused: a server that accepts anything would pass
+  # every other check while being wide open.
+  dc_key=$KEY
+  KEY=obviously-not-the-key
+  if api GET /api/units; then
+    report fail "a wrong API key was ACCEPTED -- this server is not authenticating"
+  else
+    report ok "a wrong API key is refused"
+  fi
+  KEY=$dc_key
+
+  section units
+  if ! api GET /api/units; then report fail "cannot list units: $API_ERROR"; return; fi
+  cp "$TMPD/resp.flat" "$TMPD/units.json.flat"
+  dc_n=$(jget "$TMPD/units.json.flat" .) || dc_n=0
+  if [ "$dc_n" = 0 ]; then
+    report warn "no units are configured -- add one in the web panel"
+    return
+  fi
+  report ok "$dc_n unit(s) configured"
+  if api GET /api/units/state; then
+    dc_s=$(jget "$TMPD/resp.flat" .states) || dc_s=0
+    dc_e=$(jget "$TMPD/resp.flat" .errors) || dc_e=0
+    report ok "batch read: $dc_s answered, $dc_e did not, in $HTTP_MS ms"
+    [ $((dc_s + dc_e)) -eq "$dc_n" ] || report fail "the batch covered $((dc_s + dc_e)) of $dc_n units"
+    dc_i=0
+    while [ "$dc_i" -lt "$dc_e" ]; do
+      report warn "$(jget "$TMPD/resp.flat" ".errors.$dc_i.name") did not answer: $(jget "$TMPD/resp.flat" ".errors.$dc_i.error")"
+      dc_i=$((dc_i + 1))
+    done
+  else
+    report fail "batch read failed: $API_ERROR"
+  fi
+
+  dc_i=0
+  while [ "$dc_i" -lt "$dc_n" ]; do
+    dc_id=$(jget "$TMPD/units.json.flat" ".$dc_i.id")
+    dc_name=$(jget "$TMPD/units.json.flat" ".$dc_i.name")
+    section "unit: $dc_name ($dc_id)"
+    dc_i=$((dc_i + 1))
+    if ! api GET "/api/units/$dc_id/state"; then
+      report warn "state read failed: $(printf '%s' "$API_ERROR" | head -n 1)"
+      continue
+    fi
+    if [ "$(jget "$TMPD/resp.flat" .online)" = false ]; then report warn "the unit reports itself offline"; continue; fi
+    report ok "state read in $HTTP_MS ms"
+    [ "${HTTP_MS:-0}" -le 1500 ] || report warn "$HTTP_MS ms is slow -- check the wireless signal to this unit"
+    check_state "$TMPD/resp.flat"
+    case " $DIAG_FEATURES " in
+      *" unit_capabilities "*)
+        if api GET "/api/units/$dc_id/capabilities"; then
+          dc_modes=$(jget "$TMPD/resp.flat" .operational_modes) || dc_modes=0
+          if [ "$dc_modes" = 0 ]; then report warn "the unit reported no operating modes"
+          else report ok "supports $dc_modes mode(s), $(jget "$TMPD/resp.flat" .swing_modes || printf 0) swing, $(jget "$TMPD/resp.flat" .fan_speeds || printf 0) fan speed(s)"
+          fi
+        else
+          report warn "capabilities failed: $(printf '%s' "$API_ERROR" | head -n 1)"
+        fi ;;
+    esac
+  done
+
+  section scheduling
+  case " $DIAG_FEATURES " in
+    *" programs "*)
+      if api GET /api/programs/status; then
+        if [ "$(jget "$TMPD/resp.flat" .running)" = true ]; then dc_v=ok dc_r=running; else dc_v=fail dc_r="NOT running"; fi
+        report "$dc_v" "scheduler $dc_r ($(jget "$TMPD/resp.flat" .runs || printf 0) run(s), $(jget "$TMPD/resp.flat" .errors || printf 0) error(s), tick $(jget "$TMPD/resp.flat" .tick_seconds || printf 0)s)"
+      else
+        report fail "scheduler status failed: $API_ERROR"
+      fi
+      if api GET /api/programs; then
+        report ok "$(jget "$TMPD/resp.flat" . || printf 0) program(s), $(awk -F '\t' '$1 ~ /^\.[0-9]+\.enabled$/ && $3 == "true" { n++ } END { print n + 0 }' "$TMPD/resp.flat") enabled"
+      else
+        report warn "cannot list programs: $API_ERROR"
+      fi ;;
+    *) report skip "this server has no programs feature" ;;
+  esac
+  case " $DIAG_FEATURES " in
+    *" sleep_timer "*)
+      if api GET '/api/timers?kind=all'; then report ok "$(jget "$TMPD/resp.flat" . || printf 0) timer(s) pending"
+      else report warn "cannot list timers: $API_ERROR"; fi ;;
+  esac
+
+  section "input validation"
+  # A bad value must be refused before it reaches the firmware. Read-only by
+  # construction: the server refuses it before any unit is asked anything.
+  dc_first=$(jget "$TMPD/units.json.flat" .0.id)
+  printf '{"target_temperature": 99}' >"$TMPD/body"
+  if api POST "/api/units/$dc_first/control" "$TMPD/body"; then
+    report fail "an out-of-range temperature was ACCEPTED and sent to a unit"
+  else
+    report ok "an out-of-range temperature is refused before it reaches a unit"
+  fi
+}
+
+check_state() { # FLAT
+  cs_mode=$(jget "$1" .operational_mode) || cs_mode=""
+  case "$cs_mode" in
+    AUTO | COOL | DRY | HEAT | FAN_ONLY) report ok "mode $cs_mode is a known value" ;;
+    '') report fail "no operational_mode in the state" ;;
+    *) report fail "mode '$cs_mode' is not one this API defines" ;;
+  esac
+  cs_swing=$(jget "$1" .swing_mode) || cs_swing=""
+  case "$cs_swing" in
+    OFF | VERTICAL | HORIZONTAL | BOTH) report ok "swing $cs_swing is a known value" ;;
+    '') report fail "no swing_mode in the state" ;;
+    *) report fail "swing '$cs_swing' is not one this API defines" ;;
+  esac
+  if [ "$(jtype "$1" .target_temperature)" = n ]; then
+    cs_t=$(jget "$1" .target_temperature)
+    if awk -v t="$cs_t" 'BEGIN { exit !(t >= 16 && t <= 30) }'; then report ok "target $cs_t $DEG is in range"
+    else report fail "target $cs_t $DEG is outside the 16-30 the API allows"; fi
+  else
+    report fail "no target_temperature in the state"
+  fi
+  for cs_f in indoor_temperature outdoor_temperature; do
+    if [ "$(jtype "$1" ".$cs_f")" = n ]; then
+      cs_t=$(jget "$1" ".$cs_f")
+      if awk -v t="$cs_t" 'BEGIN { exit !(t >= -50 && t <= 80) }'; then report ok "$cs_f $cs_t $DEG"
+      else report warn "$cs_f $cs_t $DEG is not a real temperature -- the unit has no such sensor"; fi
+    else
+      report skip "$cs_f is not reported"
+    fi
+  done
+}
+
+# breezectl nerd [FILE]: diag, plus what the app's Nerd screen shows, as one
+# JSON file -- the single attachment a bug report needs. The same shape as
+# `breeze-core diag --nerd` writes. Mode 600: it holds no keys or tokens, but
+# it does hold the server's hostname, LAN addresses and paths.
+cmd_nerd() {
+  [ "$#" -le 1 ] || usage_die "usage: breezectl nerd [FILE]"
+  cmd_diag
+  api GET /api/version && cp "$TMPD/resp" "$TMPD/version.json" || printf 'null' >"$TMPD/version.json"
+  [ -s "$TMPD/version.json" ] || printf 'null' >"$TMPD/version.json"
+  if api GET /api/system && [ -s "$TMPD/resp" ]; then
+    cp "$TMPD/resp" "$TMPD/system.json"
+    cn_err=null
+    cn_host=$(jget "$TMPD/resp.flat" .os.hostname) || cn_host=server
+  else
+    printf 'null' >"$TMPD/system.json"
+    cn_err=$(json_str "$API_ERROR")
+    cn_host=server
+  fi
+  cn_ms=${HTTP_MS:-0}
+  cn_host=$(printf '%s' "$cn_host" | tr -c 'A-Za-z0-9\n-' '_')
+  cn_file=${1:-breeze-core-nerd-$cn_host-$(date +%Y%m%d-%H%M%S).json}
+  {
+    printf '{\n  "breeze_core_nerd": 1,\n'
+    printf '  "generated_at": %s,\n' "$(json_str "$(date +%Y-%m-%dT%H:%M:%S)")"
+    printf '  "generated_by": %s,\n' "$(json_str "breezectl $VERSION nerd")"
+    printf '  "client": {"os": %s, "machine": %s},\n' "$(json_str "$(uname -s 2>/dev/null)")" "$(json_str "$(uname -m 2>/dev/null)")"
+    printf '  "base_url": %s,\n' "$(json_str "$BASE")"
+    printf '  "round_trip_ms": %s,\n' "$cn_ms"
+    printf '  "version": '; cat "$TMPD/version.json"; printf ',\n'
+    printf '  "system": '; cat "$TMPD/system.json"; printf ',\n'
+    printf '  "system_error": %s,\n' "$cn_err"
+    printf '  "checks": ['
+    awk -F '\t' '{
+      m = $2; gsub(/\\/, "\\\\", m); gsub(/"/, "\\\"", m)
+      printf "%s\n    {\"verdict\": \"%s\", \"message\": \"%s\"}", (NR > 1 ? "," : ""), $1, m
+    }' "$TMPD/report"
+    printf '\n  ],\n'
+    printf '  "summary": {"ok": %s, "warn": %s, "fail": %s, "skip": %s}\n}\n' "$(count ok)" "$(count warn)" "$(count fail)" "$(count skip)"
+  } >"$cn_file" || die "cannot write $cn_file"
+  chmod 600 "$cn_file" 2>/dev/null
+  section nerd
+  say "  saved to $cn_file"
+  say "  It holds this server's hostname, LAN addresses and file paths, but no"
+  say "  keys or tokens. Look it over before posting it anywhere public."
+}
+
+# --------------------------------------------------------------------- help
+
+usage() {
+  cat <<EOF
+breezectl $VERSION -- control Breeze Core from this terminal
+
+usage:
+  breezectl 'NAME' [TYPE] [TEMPERATURE] [FLAP] [FAN] [EXTRA] [TIMER]
+  breezectl status ['NAME'...]
+  breezectl units
+  breezectl timers [list | off 'NAME' 30m | start 'NAME' 07:30 [tomorrow|DAYS] | cancel ID|'NAME'|all]
+  breezectl login [URL] [--name NAME] [--label LABEL] [--ca FILE] [--key-stdin] [--yes]
+  breezectl logout [NAME]
+  breezectl servers [list | use NAME | rename OLD NEW | remove NAME]
+  breezectl diag
+  breezectl nerd [FILE]
+  breezectl version
+
+controlling a unit (the same words as breeze-core control on the server):
+  NAME         a unit's name, case-insensitive, or a unique prefix, or its id
+  TYPE         cool | heat | dry | auto | fan | on | off
+  TEMPERATURE  16-30, in half degrees
+  FLAP         both | horizontal | vertical | off
+  FAN          silent | low | medium | high | max | auto
+  EXTRA        turbo | eco | turbo+eco | no-turbo | no-eco
+  TIMER        15m | 90min | 2h -- switches the unit off after that long
+
+  'none' is valid in any position and leaves that setting alone. Every slot
+  after NAME may be omitted. A unit named like a command: breezectl control 'status' off
+
+examples:
+  breezectl kitchen cool 25.5 both auto turbo 15m
+  breezectl 'living room' heat 30 horizontal low eco
+  breezectl kitchen off
+  breezectl kitchen none none none none none 30m
+  breezectl timers start bedroom 06:45 tomorrow
+
+options, before the command:
+  --server NAME   use that saved server instead of the default (or BREEZECTL_SERVER)
+
+Saved logins live in $SERVERS_DIR, readable only by you.
+EOF
+}
+
+# --------------------------------------------------------------------- main
+
+main() {
+  OPT_SERVER="" OPT_YES=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --server | -s) [ "$#" -ge 2 ] || usage_die "--server needs a name"; OPT_SERVER=$2; shift 2 ;;
+      --server=*) OPT_SERVER=${1#--server=}; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  if [ "$#" -eq 0 ]; then
+    usage
+    [ -n "$(list_servers)" ] || { say ""; say "Start with: breezectl login"; }
+    exit 0
+  fi
+  need_curl_for=$1
+  case "$need_curl_for" in help | --help | -h | version | --version | -V | __complete) ;; *) need_curl ;; esac
+  m_cmd=$1
+  shift
+  case "$m_cmd" in
+    help | --help | -h) usage ;;
+    version | --version | -V)
+      say "breezectl $VERSION"
+      if [ -n "$(current_server)" ] && command -v curl >/dev/null 2>&1; then
+        load_server
+        if api GET /api/version; then say "server '$SERVER': Breeze Core $(jget "$TMPD/resp.flat" .version) at $BASE"; fi
+      fi ;;
+    control) cmd_control "$@" ;;
+    status | st) cmd_status "$@" ;;
+    units | list) cmd_units "$@" ;;
+    timers | timer) cmd_timers "$@" ;;
+    login | pair) cmd_login "$@" ;;
+    logout | unpair) cmd_logout "$@" ;;
+    servers | server) cmd_servers "$@" ;;
+    diag | doctor) cmd_diag "$@"; [ "$(count fail)" -eq 0 ] || exit 1 ;;
+    nerd) cmd_nerd "$@"; [ "$(count fail)" -eq 0 ] || exit 1 ;;
+    __complete) cmd_complete "$@" ;;
+    -*) usage_die "unknown option $m_cmd" ;;
+    *) cmd_control "$m_cmd" "$@" ;;
+  esac
+}
+
+# Sourced by the tests with BREEZECTL_LIB=1, which want the functions only.
+if [ "${BREEZECTL_LIB:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+main "$@"
