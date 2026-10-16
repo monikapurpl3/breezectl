@@ -24,10 +24,13 @@ if [ -z "$dirty" ]; then
   fi
 fi
 
+# From standard input, never a file name: GNU sha256sum escapes its whole line
+# with a leading backslash when the name holds one (D:\a\_temp/... on a
+# Windows runner), and the hash would then start with it.
 sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
-  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f 1
-  else openssl dgst -sha256 "$1" | sed 's/^.*= *//'
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum <"$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 <"$1" | cut -d ' ' -f 1
+  else openssl dgst -sha256 <"$1" | sed 's/^.*= *//'
   fi
 }
 

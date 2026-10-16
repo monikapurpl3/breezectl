@@ -125,11 +125,14 @@ fetch() { # RELATIVE-PATH DESTINATION
   esac
 }
 
+# From standard input, never a file name: GNU sha256sum escapes its whole line
+# with a leading backslash when the name holds one (D:\a\_temp/... on a
+# Windows runner), and the hash would then start with it.
 sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
-  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f 1
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum <"$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 <"$1" | cut -d ' ' -f 1
   elif command -v sha256 >/dev/null 2>&1; then sha256 -q "$1"
-  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | sed 's/^.*= *//'
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 <"$1" | sed 's/^.*= *//'
   else return 1
   fi
 }
