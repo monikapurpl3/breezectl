@@ -68,9 +68,13 @@ message here.
 ## Testing against something real
 
 - Unit-free: `sh tests/run.sh`, `pwsh -File tests/run.ps1`.
-- A server with emulated units: breeze-mock's `examples/bench.rs` +
-  `breeze-core serve --port 18433` with `AC_CONFIG_DIR` at its store; key
-  `bench-key-not-a-secret`. From containers it is `host.docker.internal:18433`.
+- A server with emulated units: `breeze-mock run` on a blueprint (M:\breeze-mock;
+  `examples/minimal.xml` is one unit and a mock server on 18420), then either
+  pair breezectl with that mock server itself (`<pairing approve="auto"/>`
+  makes approval automatic), or run a real Breeze Core on the same units:
+  `breeze-mock export breeze-core-config BLUEPRINT -o DIR/config.json` (it
+  prints the API key) and `AC_CONFIG_DIR=DIR BREEZE_PORT=18433 breeze-core serve`.
+  From containers it is `host.docker.internal:18433`.
 - Real units: only brief tests on the maintainer's say-so, and every setting
   restored exactly afterwards.
 
