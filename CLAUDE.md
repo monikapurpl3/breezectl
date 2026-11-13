@@ -21,6 +21,14 @@ message here.
 | `tests/install-windows.ps1` | install.ps1, on a throwaway registry key |
 | `tests/zsh-capture.zsh` | prints what zsh's completion offers, for tests |
 
+**`tests/` is not in the repository.** The maintainer took it off GitHub
+(2026-10-16) and keeps it local (2026-11-13): the suites live in the
+working tree, out of git through `.git/info/exclude`, and are run here
+before every commit. CI checks only what needs no suite: that both clients
+parse and answer under every shell and PowerShell, ShellCheck, staging, and
+the installers' install, reinstall and uninstall. The suites exist nowhere
+else, so back them up.
+
 ## Rules that are not obvious from the code
 
 - **The two clients say the same things.** Same commands, same words, same
@@ -74,7 +82,9 @@ message here.
 
 ## Testing against something real
 
-- Unit-free: `sh tests/run.sh`, `pwsh -File tests/run.ps1`.
+- Unit-free (local only, see above): `sh tests/run.sh`, `pwsh -File tests/run.ps1`;
+  the other shells and awks in a Docker container (`debian:stable-slim` has
+  dash, mksh, ksh93, posh, zsh, busybox, mawk, gawk and BWK awk).
 - A server with emulated units: `breeze-mock run` on a blueprint (M:\breeze-mock;
   `examples/minimal.xml` is one unit and a mock server on 18420), then either
   pair breezectl with that mock server itself (`<pairing approve="auto"/>`
