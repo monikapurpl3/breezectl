@@ -1140,6 +1140,33 @@ function Test-State($state) {
     }
 }
 
+# Write a file readable by its owner alone: NAME in DIR (the current folder).
+# A name of one's own choosing goes there or nowhere; the default name goes in
+# the home folder instead when DIR cannot be written to -- a shell can start
+# anywhere, PowerShell's own install folder included. Returns what to show and
+# the folder that refused, if it went home.
+function Save-Private([string]$text, [string]$name, [bool]$chosen, [string]$dir, [string]$homeDir = $HOME) {
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $here = $dir
+    if (-not $here) { $here = (Get-Location -PSProvider FileSystem).Path }
+    $path = $name
+    if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path $here $name }
+    $shown = $path
+    if (-not $dir) { $shown = $name }
+    $moved = $null
+    try { [IO.File]::WriteAllText($path, $text, $utf8) }
+    catch {
+        if ($chosen -or -not $homeDir) { Fail "cannot write $name" }
+        $moved = $here
+        $path = Join-Path $homeDir $name
+        $shown = $path
+        try { [IO.File]::WriteAllText($path, $text, $utf8) }
+        catch { Fail "cannot write $name, here or in your home folder" }
+    }
+    if (-not $script:OnWindows) { & chmod 600 $path 2>$null }
+    return [pscustomobject]@{ Shown = $shown; Moved = $moved }
+}
+
 # The same shape as `breeze-core diag --nerd` writes. No keys or tokens, but the
 # server's hostname, LAN addresses and paths: worth a look before posting.
 function Invoke-Nerd([string[]]$a) {
@@ -1166,12 +1193,10 @@ function Invoke-Nerd([string[]]$a) {
         checks = $script:Report.ToArray()
         summary = [ordered]@{ ok = (Get-Count 'ok'); warn = (Get-Count 'warn'); fail = (Get-Count 'fail'); skip = (Get-Count 'skip') }
     }
-    $path = $file
-    if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path (Get-Location).Path $path }
-    [IO.File]::WriteAllText($path, ($doc | ConvertTo-Json -Depth 32) + "`n", (New-Object Text.UTF8Encoding($false)))
-    if (-not $script:OnWindows) { & chmod 600 $path 2>$null }
+    $saved = Save-Private (($doc | ConvertTo-Json -Depth 32) + "`n") $file ($a.Count -eq 1)
     Write-Section 'nerd'
-    Say "  saved to $file"
+    Say "  saved to $($saved.Shown)"
+    if ($saved.Moved) { Say "  ($($saved.Moved) cannot be written to, so it went in your home folder.)" }
     Say "  It holds this server's hostname, LAN addresses and file paths, but no"
     Say '  keys or tokens. Look it over before posting it anywhere public.'
 }

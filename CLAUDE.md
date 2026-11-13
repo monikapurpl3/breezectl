@@ -44,7 +44,14 @@ message here.
   `$null` -- use `@(As-List ...)`; `@(List[object])` inside a hashtable
   literal throws "Argument types do not match" -- use `.ToArray()`;
   PowerShell 7 turns ISO date strings into `[datetime]` (`Get-IsoText`);
-  `Select-Object -First` on a native command leaves a failed `$LASTEXITCODE`.
+  `Select-Object -First` on a native command leaves a failed `$LASTEXITCODE`;
+  an alias beats a function of the same name (`sv` is `Set-Variable`, `sc`,
+  `si`, `sl`, `gc` ... too), so never name a helper after one; `$HOME` is
+  read-only, so a function that writes there takes the folder as a parameter.
+- **A file written under a default name goes home if the current folder
+  refuses it** (`save_private` / `Save-Private`): a shell can start anywhere,
+  PowerShell's own install folder included (where an ssh session drops you).
+  A name the user chose goes there or nowhere.
 - **Never test install.ps1 against the real PATH.** `tests/install-windows.ps1`
   sets `BREEZECTL_TEST_ENV_KEY` (another key under HKCU) and
   `BREEZECTL_TEST_PROFILE`; it deletes its key afterwards. Compare the real

@@ -1429,6 +1429,26 @@ check_state() { # FLAT
   done
 }
 
+# save_private SRC NAME CHOSEN [DIR]: copy SRC to NAME in DIR (the current
+# directory), readable by its owner alone. A name of one's own choosing goes
+# there or nowhere; the default name goes in the home directory instead when
+# DIR cannot be written to -- a shell can start anywhere, an install folder
+# included. Sets SAVED (as it should be shown) and MOVED (the directory that
+# refused, if it went home).
+save_private() {
+  sp_dir=${4:-.} SAVED=$2 MOVED=""
+  [ "$sp_dir" = . ] || SAVED="$sp_dir/$2"
+  if (umask 077 && cp "$1" "$SAVED") 2>/dev/null; then
+    chmod 600 "$SAVED" 2>/dev/null
+    return 0
+  fi
+  [ -z "$3" ] && [ -n "${HOME:-}" ] || return 1
+  if [ "$sp_dir" = . ]; then MOVED=$(pwd); else MOVED=$sp_dir; fi
+  SAVED="$HOME/$2"
+  (umask 077 && cp "$1" "$SAVED") 2>/dev/null || return 1
+  chmod 600 "$SAVED" 2>/dev/null
+}
+
 # breezectl nerd [FILE]: diag, plus what the app's Nerd screen shows, as one
 # JSON file -- the single attachment a bug report needs. The same shape as
 # `breeze-core diag --nerd` writes. Mode 600: it holds no keys or tokens, but
@@ -1449,7 +1469,7 @@ cmd_nerd() {
   fi
   cn_ms=${HTTP_MS:-0}
   cn_host=$(printf '%s' "$cn_host" | tr -c 'A-Za-z0-9\n-' '_')
-  cn_file=${1:-breeze-core-nerd-$cn_host-$(date +%Y%m%d-%H%M%S).json}
+  cn_name=${1:-breeze-core-nerd-$cn_host-$(date +%Y%m%d-%H%M%S).json}
   {
     printf '{\n  "breeze_core_nerd": 1,\n'
     printf '  "generated_at": %s,\n' "$(json_str "$(date +%Y-%m-%dT%H:%M:%S)")"
@@ -1467,10 +1487,14 @@ cmd_nerd() {
     }' "$TMPD/report"
     printf '\n  ],\n'
     printf '  "summary": {"ok": %s, "warn": %s, "fail": %s, "skip": %s}\n}\n' "$(count ok)" "$(count warn)" "$(count fail)" "$(count skip)"
-  } >"$cn_file" || die "cannot write $cn_file"
-  chmod 600 "$cn_file" 2>/dev/null
+  } >"$TMPD/nerd.json" || die "cannot write $cn_name"
+  if ! save_private "$TMPD/nerd.json" "$cn_name" "${1:-}"; then
+    [ -z "${1:-}" ] || die "cannot write $cn_name"
+    die "cannot write $cn_name, here or in your home folder"
+  fi
   section nerd
-  say "  saved to $cn_file"
+  say "  saved to $SAVED"
+  [ -z "$MOVED" ] || say "  ($MOVED cannot be written to, so it went in your home folder.)"
   say "  It holds this server's hostname, LAN addresses and file paths, but no"
   say "  keys or tokens. Look it over before posting it anywhere public."
 }
