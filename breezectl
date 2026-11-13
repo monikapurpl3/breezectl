@@ -16,7 +16,7 @@
 #
 # Copyright 2026 Monika. AGPL-3.0-or-later; see LICENSE.
 
-VERSION=1.0.0
+VERSION=1.0.1
 
 # Run by zsh (`zsh breezectl`, or a system whose sh is zsh), behave as sh:
 # split words and expand globs the way the rest of this file expects.

@@ -19,7 +19,7 @@
 #
 # Copyright 2026 Monika. AGPL-3.0-or-later; see LICENSE.
 
-$script:Version = '1.0.0'
+$script:Version = '1.0.1'
 $ErrorActionPreference = 'Stop'
 
 # ------------------------------------------------------------------ basics
